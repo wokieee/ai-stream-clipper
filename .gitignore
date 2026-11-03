@@ -1,0 +1,19 @@
+# Generated media — never commit video files
+downloads/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Whisper model cache
+*.pt
+
+# Logs / temp
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

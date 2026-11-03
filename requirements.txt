@@ -1,0 +1,7 @@
+numpy>=2.0.0
+openai-whisper
+yt-dlp
+moviepy
+torch
+torchaudio
+opencv-python
