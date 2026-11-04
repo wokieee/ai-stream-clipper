@@ -713,7 +713,9 @@ def suggest_title_and_hashtags(text, min_words=15):
     if llm_tags:
         clean = [t.lstrip('#') for t in llm_tags if len(t) > 1]
         if clean:
-            hashtags = ['#Shorts', '#Viral', '#fyp'] + clean[:3]
+            # Re-add the '#' — the LLM tags were stripped above so the
+            # same word could be deduped against the fixed filler tags.
+            hashtags = ['#Shorts', '#Viral', '#fyp'] + ['#' + t for t in clean[:3]]
     return {'title': title, 'hashtags': hashtags}
 
 
