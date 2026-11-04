@@ -17,3 +17,6 @@ venv/
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Auth — session cookies for yt-dlp (never commit!)
+cookies.txt

@@ -67,6 +67,34 @@ def download_video(url, run_id=None, min_height=1080):
     node_path = r"C:\Program Files\nodejs\node.exe"
     js_runtime = f"node:{node_path}" if os.path.exists(node_path) else "node"
 
+    # YouTube's "Sign in to confirm you're not a bot" check is common on
+    # certain videos. A logged-in browser cookie lets yt-dlp authenticate.
+    # Chrome's SQLite cookie DB is locked while Chrome runs (yt-dlp issue
+    # #7271), so we also support a manually-exported cookies.txt as backup.
+    cookies_arg = []
+    cookies_file = os.path.join(CLIPPER_DIR, "cookies.txt")
+    if os.path.exists(cookies_file):
+        cookies_arg = ["--cookies", cookies_file]
+    else:
+        chrome_data = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+        if os.path.isdir(chrome_data):
+            profile = "chrome"  # default profile
+            try:
+                import json as _json
+                local_state = os.path.join(chrome_data, "Local State")
+                if os.path.exists(local_state):
+                    with open(local_state, encoding="utf-8") as fh:
+                        info = _json.load(fh).get("profile", {}).get("info_cache", {})
+                    # Prefer the most-recently-active profile that has a Cookies file
+                    for name in sorted(info, key=lambda n: info[n].get("active_time", 0), reverse=True):
+                        cookie_db = os.path.join(chrome_data, name, "Network", "Cookies")
+                        if os.path.exists(cookie_db):
+                            profile = "chrome" if name == "Default" else f"chrome:{name}"
+                            break
+            except Exception:
+                pass
+            cookies_arg = ["--cookies-from-browser", profile]
+
     # Format spec: prefer 1080p+ mp4, fall back to best available
     fmt = (
         f"bestvideo[height>={min_height}][ext=mp4]+bestaudio[ext=m4a]/"
@@ -83,7 +111,7 @@ def download_video(url, run_id=None, min_height=1080):
         "--merge-output-format", "mp4",
         "-o", output_path,
         url,
-    ]
+    ] + cookies_arg
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError:
@@ -97,7 +125,7 @@ def download_video(url, run_id=None, min_height=1080):
             "--merge-output-format", "mp4",
             "-o", output_path,
             url,
-        ]
+        ] + cookies_arg
         subprocess.run(cmd_fallback, check=True)
     return output_path
 
@@ -226,6 +254,7 @@ before you your yours i me my mine we our ours they them their he she him his
 her its this that these those is are was were am be been being do does did
 doing have has had having would could should will can shall just really like
 know got go going gonna thing things yeah okay oh um uh ah well very much
+thank thanks tomorrow today again everybody welcome
 """.split())
 
 # Words that make a short title feel "viral" (curiosity / emotion / shock).
@@ -245,6 +274,94 @@ _HASHTAG_STOP = _STOP_WORDS | {
     'made', 'even', 'still', 'also', 'only', 'own', 'same', 'such', 'than',
     'too', 'very', 'well', 'back', 'after', 'first', 'last', 'see', 'seen',
     'taking', 'take', 'put', 'gets', 'going', 'would', 'there', 'their',
+    # spoken filler the base stop list misses
+    'gonna', 'wanna', 'kinda', 'sorta', 'alright', 'yep', 'nah', 'honestly',
+    'dude', 'bro', 'buddy', 'man', 'guy', 'guys', 'lol', 'lmao', 'haha',
+    'stuff', 'wow', 'whoa', 'ooh', 'ahh', 'dude',
+    # high-frequency verbs/nouns that are almost never the topic
+    'come', 'comes', 'came', 'coming', 'want', 'wants', 'wanted', 'need',
+    'needs', 'needed', 'think', 'thinking', 'thought', 'say', 'says',
+    'said', 'saying', 'tell', 'tells', 'telling', 'told', 'call', 'calls',
+    'called', 'calling', 'look', 'looks', 'looking', 'looked', 'feel',
+    'feels', 'felt', 'let', 'lets', 'try', 'trying', 'tried', 'use',
+    'uses', 'used', 'using', 'find', 'finds', 'finding', 'found', 'give',
+    'gives', 'gave', 'given', 'takes', 'took', 'taken', 'gone', 'went',
+    'mean', 'means', 'meant', 'guess', 'figure', 'figures', 'figured',
+    'time', 'times', 'day', 'days', 'night', 'nights', 'week', 'weeks',
+    'part', 'lot', 'little', 'bit', 'kind', 'sort', 'way', 'ways', 'one',
+    'two', 'three', 'new', 'old', 'good', 'bad', 'big', 'long', 'right',
+    'left', 'ever', 'many', 'more', 'most', 'some', 'every', 'each',
+    'other', 'another', 'maybe', 'fine', 'nice', 'cool',
+    # Common verbs — almost never the actual topic of a short
+    'bought', 'buy', 'sell', 'sold', 'barking', 'bark', 'laughed', 'laugh',
+    'laughing', 'jumped', 'jump', 'exploded', 'explode', 'exploding',
+    'broke', 'break', 'broken', 'breaking', 'fix', 'fixed', 'fixing',
+    'figured', 'figure', 'figuring', 'happen', 'happened', 'happening',
+    'think', 'thought', 'know', 'known', 'knowing', 'see', 'seen',
+    'watch', 'watched', 'watching', 'look', 'looked', 'looking', 'heard',
+    'hear', 'hearing', 'felt', 'feel', 'feeling', 'made', 'make', 'making',
+    'take', 'took', 'taken', 'taking', 'give', 'gave', 'given', 'giving',
+    'go', 'went', 'gone', 'going', 'come', 'came', 'coming', 'get', 'got',
+    'getting', 'put', 'set', 'let', 'try', 'tried', 'trying',
+    'use', 'used', 'using', 'need', 'needed', 'want', 'wanted', 'wanting',
+    'call', 'called', 'calling', 'tell', 'told', 'telling', 'ask', 'asked',
+    'asking', 'find', 'found', 'finding', 'work', 'worked', 'working',
+    'play', 'played', 'playing', 'run', 'ran', 'running', 'move', 'moved',
+    'moving', 'change', 'changed', 'changing', 'start', 'started', 'starting',
+    'stop', 'stopped', 'stopping', 'end', 'ended', 'ending', 'open', 'opened',
+    'close', 'closed', 'closing', 'wait', 'waited', 'waiting', 'leave',
+    'left', 'leaving', 'bring', 'brought', 'bringing', 'hold', 'held',
+    'holding', 'keep', 'kept', 'keeping', 'show', 'shown', 'showing',
+    'turn', 'turned', 'turning', 'become', 'became', 'becoming', 'become',
+}
+
+# Curated topic words — real, searchable tags. A 6s clip's transcript is
+# too short for frequency alone to surface a good topic (generic nouns like
+# "store" or "table" always outrank the actual subject), so we boost words
+# from this list. These are the kinds of words that make a good hashtag.
+_TOPIC_WORDS = {
+    # gaming
+    'minecraft', 'fortnite', 'roblox', 'gaming', 'gamer', 'gameplay',
+    'speedrun', 'speedrunning', 'clutch', 'buff', 'nerf', 'meta',
+    'raid', 'boss', 'level', 'levels', 'quest', 'quests', 'tournament',
+    'esports', 'esport', 'fps', 'rpg', 'mmo', 'steam',
+    # tech / software
+    'python', 'javascript', 'coding', 'developer', 'programming', 'algorithm',
+    'bug', 'debug', 'compile', 'kernel', 'linux', 'windows', 'macos', 'ios',
+    'android', 'react', 'docker', 'kubernetes', 'server', 'database', 'api',
+    'startup', 'saas', 'cloud', 'aws', 'azure', 'devops', 'deploy',
+    # money / business
+    'crypto', 'bitcoin', 'ethereum', 'solana', 'nft', 'defi', 'trading',
+    'trader', 'investor', 'investment', 'stocks', 'stock', 'etf', 'dividend',
+    'revenue', 'profit', 'ecommerce', 'dropshipping', 'affiliate',
+    'passive', 'income', 'sidehustle', 'freelance', 'freelancer',
+    # content creation
+    'editing', 'premiere', 'aftereffects', 'davinci', 'canva', 'thumbnail',
+    'thumbnails', 'monetize', 'monetization', 'subscriber', 'subscribers',
+    'views', 'viewers', 'livestream', 'streamer', 'streamers', 'twitch',
+    'youtube', 'tiktok', 'instagram', 'podcast', 'podcasting',
+    'vlogger', 'vloggers', 'content', 'creator', 'creators', 'influencer',
+    'collab', 'collaboration', 'challenge', 'unboxing', 'review', 'reviews',
+    # lifestyle
+    'fitness', 'workout', 'gym', 'muscle', 'weight', 'diet', 'vegan',
+    'veggie', 'recipe', 'recipes', 'cooking', 'cook', 'meal', 'meals',
+    'travel', 'travelling', 'traveler', 'vacation', 'adventure', 'hiking',
+    'camping', 'explore', 'exploring', 'expedition', 'mukbang',
+    'asmr', 'study', 'studying', 'productivity', 'discipline', 'motivation',
+    # social / culture
+    'meme', 'memes', 'trend', 'trends', 'interview', 'documentary',
+    'documentaries', 'history', 'historical',
+    'science', 'scientist', 'physics', 'biology', 'space', 'planet',
+    'planets', 'universe', 'galaxy', 'galaxies', 'ai', 'machine',
+    'learning', 'neural', 'robot', 'robotics', 'automation',
+    # emotions / hooks (good for curiosity titles AND tags)
+    'insane', 'crazy', 'shocking', 'unbelievable', 'incredible', 'wild',
+    'epic', 'legendary', 'satisfying', 'satisfied', 'hilarious', 'funny',
+    'honest', 'real', 'reality', 'secret', 'secrets', 'truth',
+    'exposed', 'exposure', 'conspiracy', 'theory', 'mystery', 'sus',
+    # people / identity
+    'dad', 'mom', 'bro', 'sister', 'brother', 'friend',
+    'friends', 'community', 'squad', 'team', 'fam',
 }
 
 
@@ -260,7 +377,19 @@ def suggest_title_and_hashtags(text, min_words=15):
     text = re.sub(r'\s+', ' ', text).strip()
 
     # ── Title ──────────────────────────────────────────────────────────────
-    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    # Whisper transcripts rarely have reliable sentence punctuation, so we
+    # split on MORE than just [.!?]: quotes, dashes, "and/but/so" connectors,
+    # and backticks. That gives us real candidate phrases instead of one giant
+    # unpunctuated blob that the fallback then has to chop blindly.
+    sentences = [s.strip() for s in re.split(r'[\.\!?;:\"‘’“”—–\|]', text) if s.strip()]
+    # Also split long unpunctuated runs on conjunctions so "I went to the
+    # store and bought milk and it was great" becomes two candidates.
+    expanded = []
+    for s in sentences:
+        parts = re.split(r'\b(?:and|but|so|because|although|while|if|when)\b', s)
+        expanded.extend(p.strip() for p in parts if p.strip())
+    sentences = expanded or sentences
+
     scored = []
     for s in sentences:
         words = s.split()
@@ -282,17 +411,62 @@ def suggest_title_and_hashtags(text, min_words=15):
         if any(w in ('um', 'uh', 'ah', 'like', 'so', 'you know', 'okay', 'yeah')
                for w in words[:2]):
             score -= 1.5
+        # Reward phrases ending in a hook (question or strong verb)
+        if words and words[-1].lower() in ('now', 'today', 'ever', 'again', 'right', 'watch'):
+            score += 0.4
         scored.append((score, s))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    if scored:
+    if scored and scored[0][0] > 0:
         title_src = scored[0][1]
-        # If the "sentence" is really the whole unpunctuated clip, trim to a
-        # clean 8-word phrase instead of leaving a trailing fragment.
-        if len(title_src.split()) > 9:
-            title_src = " ".join(title_src.split()[:8])
+        # If the "sentence" is really the whole unpunctuated clip, don't just
+        # lop off the tail — slide a 4-9 word window across it and keep the
+        # window with the most viral/noun punch (a cut mid-phrase reads like
+        # a truncated thought, which is worse than a short complete one).
+        words = title_src.split()
+        if len(words) > 9:
+            best = None
+            for n in (9, 8, 7, 6, 5, 4):
+                for i in range(0, len(words) - n + 1):
+                    window = words[i:i + n]
+                    low = " ".join(window).lower()
+                    s = 0.5
+                    s += 0.7 * sum(1 for w in _VIRAL_WORDS
+                                   if re.search(r'\b' + re.escape(w) + r'\b', low))
+                    # Penalize windows that start mid-thought on a filler
+                    if window and window[0].lower() in ('and', 'but', 'so', 'the', 'that'):
+                        s -= 0.4
+                    # A title should END on a content word, not trail off on
+                    # "thank", "was", "just" — that reads like a half-thought.
+                    if window and window[-1].lower() in _STOP_WORDS:
+                        s -= 1.2
+                    if best is None or s > best[0]:
+                        best = (s, " ".join(window))
+                if best and best[0] > 0.5:
+                    break
+            if best:
+                title_src = best[1]
     else:
-        title_src = " ".join(text.split()[:min(min_words, 8)])
+        # No clean phrase survived — score 4-9 word windows across the raw
+        # text and pick the one with the most viral/noun-ish punch, instead
+        # of blindly dumping the first 10 words.
+        raw = text.split()
+        windows = []
+        for n in (7, 6, 5, 8, 4):
+            for i in range(0, max(1, len(raw) - n + 1)):
+                window = raw[i:i + n]
+                low = " ".join(window).lower()
+                s = 1.0
+                s += 0.7 * sum(1 for w in _VIRAL_WORDS
+                               if re.search(r'\b' + re.escape(w) + r'\b', low))
+                # Penalize windows that are mostly filler/function words
+                filler = sum(1 for w in window if w.lower() in _STOP_WORDS)
+                s -= 0.8 * filler
+                windows.append((s, " ".join(window)))
+            if windows:
+                break
+        windows.sort(key=lambda x: x[0], reverse=True)
+        title_src = windows[0][1] if windows else " ".join(raw[:5])
 
     # Title case (short words stay lowercase except the first)
     small = {'a', 'an', 'the', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'at',
@@ -308,20 +482,47 @@ def suggest_title_and_hashtags(text, min_words=15):
     title = ' '.join(titled).rstrip('.,;:').strip()
     if title:
         title = title[0].upper() + title[1:]
+    # A title that trails off on a function word ("...on the Channel Thank")
+    # reads like a half-thought. Trim trailing stop words (keep at least
+    # three words so the title never collapses into nonsense).
+    tw = title.split()
+    while len(tw) > 3 and tw[-1].lower() in _STOP_WORDS:
+        tw.pop()
+    title = ' '.join(tw)
     # Hard cap at ~52 chars at a word boundary
     if len(title) > 52:
         title = title[:52].rsplit(' ', 1)[0].rstrip('.,;:')
 
     # ── Hashtags ───────────────────────────────────────────────────────────
+    # Only count words that are long enough to actually be a topic, and
+    # drop anything that is a stop word, filler, or high-frequency verb —
+    # those are what produced the "random words" before.
     freq = {}
     for w in re.findall(r"[A-Za-z][A-Za-z0-9']+", text.lower()):
-        if w in _HASHTAG_STOP or len(w) < 4:
+        if w in _HASHTAG_STOP or len(w) < 5:
+            continue
+        # Skip words that are just a Whisper timestamp artifact or possessive
+        if w.endswith("'s") or w.endswith("'t"):
             continue
         freq[w] = freq.get(w, 0) + 1
-    # Weight by frequency but prefer specific (longer) words over generic ones
-    top = sorted(freq,
-                 key=lambda w: freq[w] * (1 + 0.25 * min(len(w) - 4, 6)),
-                 reverse=True)[:5]
+    # Weight by frequency but prefer specific (longer) words over generic ones.
+    # A curated topic word is worth a lot more than a random frequent noun,
+    # so it gets a big boost — that's what separates "#Fortnite" from "#Table".
+    def _tag_score(w):
+        base = freq[w] * (1 + 0.25 * min(len(w) - 4, 6))
+        if w in _TOPIC_WORDS:
+            base *= 6.0
+        return base
+
+    # Rank everything, then split into curated-topic vs. generic. Generic
+    # nouns (store, table, patch, channel) are only worth showing when we
+    # couldn't find real topics — otherwise they just crowd out the good
+    # tags. And even then, ONE generic noun is enough; a pile of them is
+    # just noise.
+    ranked = sorted(freq, key=_tag_score, reverse=True)
+    topics = [w for w in ranked if w in _TOPIC_WORDS]
+    others = [w for w in ranked if w not in _TOPIC_WORDS]
+    top = (topics + others[:1])[:5]
     hashtags = ['#Shorts', '#Viral', '#fyp'] + [w.capitalize() for w in top]
     return {'title': title, 'hashtags': hashtags}
 
@@ -341,33 +542,115 @@ def _get_face_detector():
     return _face_detector
 
 
-def build_speaker_track(video, sample_step=5, smooth_sec=0.8):
+def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
+                        max_jump_frac=0.22, hold_frames=5):
     """
-    Sample frames, detect the largest face, and return a smoothed
-    center-x track (function of time, in source pixel coords).
-    Falls back to frame center when no face is found.
+    Sample frames and return a smoothed center-x track (function of time,
+    in source pixel coords) that follows the *speaker*, not the largest
+    face on screen.
+
+    Why this matters: picking the largest face per frame independently lets
+    a nearby animal (or any large object) hijack the crop every frame. The
+    speaker is rarely the biggest thing in frame — they are the face that
+    stays near where it was last.
+
+    Strategy:
+      1. Seed from the opening seconds at the face that is detected in the
+         most frames at a given location — the speaker's facecam is present
+         in nearly every frame, while a passer-by or pet flickers in and
+         out. Size is only a tiebreak among equally-persistent faces.
+      2. Each frame, score every detected face by distance to the previous
+         tracked position. Closest candidate wins.
+      3. A candidate must be within max_jump_frac of the frame width from
+         the current track, otherwise we HOLD the previous position instead
+         of jumping to a distant animal.
+      4. The new position must be confirmed for hold_frames consecutive
+         frames before it can take over — flicker doesn't steal the lock.
+      5. Falls back to frame center when no face is found at all.
     """
     detector = _get_face_detector()
     w, h = video.size
     duration = video.duration
     fps = video.fps or 24
-    det_w, det_h = 320, max(1, int(h * 320.0 / w))
+    # 640px input, NOT 320: a facecam face is only ~150px in a 1080p frame,
+    # and shrinking to 320 width makes it ~25px — below YuNet's reliable size.
+    # At 320 we missed ~60% of frames (tracker "held" through long dead zones);
+    # at 640 detection recall on real stream footage was ~100%.
+    det_w = 640
+    det_h = max(1, int(h * float(det_w) / w))
     scale = w / det_w  # source px per small-frame px
+    max_jump = max_jump_frac * w
 
     times, xs = [], []
     last_x = w / 2.0
+    pending_x = None        # candidate waiting for hold_frames confirmation
+    pending_count = 0
     n_frames = int(duration * fps)
 
-    for i in range(0, n_frames, sample_step):
+    def detect_at(i):
         t = min(i / fps, max(0.0, duration - 0.01))
         frame = video.get_frame(t)
         small = cv2.resize(frame, (det_w, det_h))
         detector.setInputSize((det_w, det_h))
         rc, faces = detector.detect(small)
+        return faces  # may be None
+
+    # ── Seed: find the most *persistent* face in the opening seconds ─────────
+    # Stream facecams sit anywhere in frame (often a corner), so starting from
+    # center and drifting would lock onto whatever is central (pet, mascot,
+    # overlay). The speaker's face is detected in nearly every frame; an
+    # animal/passer-by is not. Size is only a tiebreak.
+    seed_frames = list(range(0, min(n_frames, sample_step * 24), sample_step))
+    clusters = []  # list of [x_center_sum, count, size_sum] in det px
+    for i in seed_frames:
+        faces = detect_at(i)
+        if faces is None:
+            continue
+        for f in faces:
+            cx = (f[0] + f[2] / 2.0) * scale
+            for c in clusters:
+                if abs(c[0] / c[1] - cx) <= max_jump:
+                    c[0] += cx
+                    c[1] += 1
+                    c[2] += f[2] * f[3]
+                    break
+            else:
+                clusters.append([cx, 1, f[2] * f[3]])
+    if clusters:
+        # Persistence first, size as tiebreak
+        best_c = max(clusters, key=lambda c: (c[1], c[2]))
+        last_x = best_c[0] / best_c[1]
+
+    for i in range(0, n_frames, sample_step):
+        t = min(i / fps, max(0.0, duration - 0.01))
+        faces = detect_at(i)
+
+        chosen = None
         if faces is not None and len(faces):
-            # Pick the largest face
-            best = max(faces, key=lambda f: f[2] * f[3])
-            last_x = (best[0] + best[2] / 2.0) * scale
+            # Score each face: prefer proximity to the current track, then size.
+            def score(f):
+                cx = (f[0] + f[2] / 2.0) * scale
+                dist = abs(cx - last_x)
+                return (dist, -(f[2] * f[3]))
+
+            faces_sorted = sorted(faces, key=score)
+            cand = faces_sorted[0]
+            cand_x = (cand[0] + cand[2] / 2.0) * scale
+            if abs(cand_x - last_x) <= max_jump:
+                chosen = cand_x
+
+        if chosen is not None:
+            if pending_x is not None and abs(chosen - pending_x) <= 0.5 * max_jump:
+                pending_count += 1
+            else:
+                pending_x = chosen
+                pending_count = 1
+            if pending_count >= hold_frames:
+                last_x = pending_x
+                pending_x = None
+                pending_count = 0
+        # else: hold last_x (no jump to a distant animal)
+
         times.append(t)
         xs.append(last_x)
 
