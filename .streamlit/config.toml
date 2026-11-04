@@ -1,0 +1,5 @@
+[server]
+# Raise Streamlit's default 200MB upload cap so hour-long
+# multi-GB recordings can be dragged into the box. Value is MB.
+maxUploadSize = 5000
+maxMessageSize = 5000

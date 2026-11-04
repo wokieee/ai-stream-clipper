@@ -92,57 +92,15 @@ source_mode = st.radio(
 if source_mode == "Paste URL":
     url = st.text_input("Paste Stream / Video URL (YouTube, Twitch, etc.)")
 else:
-    uploaded_video_path = None  # set only if a file was dragged in
-    # Two ways to pick a video already on your computer:
-    #  A) Drag it into the box (like the logo uploader) — quick for clips.
-    #  B) Browse a folder via the dropdown — the file is read directly,
-    #     never uploaded or copied, so there is NO size limit and an
-    #     hour-long 5GB recording works fine. Use this for big files,
-    #     since the drag box has Streamlit's 200MB upload cap.
-    st.markdown("Drag a video file into the box, or pick one from a folder.")
-    col_drag, col_folder = st.columns([3, 2])
-
-    with col_drag:
-        uploaded = st.file_uploader(
-            "Drop a video file here",
-            type=["mp4", "mkv", "mov", "webm", "avi", "flv"],
-            key="local_video_uploader",
-            help="Drag a video file into this box. Best for clips under ~200MB.",
-        )
-
-    with col_folder:
-        folder = st.text_input(
-            "Folder to browse",
-            value="C:\\AI-Stream-Clipper\\downloads",
-            help="Type or paste a folder path. The dropdown lists every video file in it.",
-        )
-        video_exts = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv")
-        if folder and os.path.isdir(folder):
-            videos = sorted(
-                os.path.join(folder, f)
-                for f in os.listdir(folder)
-                if f.lower().endswith(video_exts)
-            )
-            if videos:
-                labels = [f"{os.path.basename(v)} ({os.path.getsize(v)/1e6:.0f} MB)" for v in videos]
-                chosen = st.selectbox(
-                    "Choose a video file",
-                    options=videos,
-                    format_func=lambda p: labels[videos.index(p)],
-                    key="local_video_dropdown",
-                )
-                selected_video = chosen
-                st.success(f"Selected: {os.path.basename(chosen)} "
-                           f"({os.path.getsize(chosen)/1e9:.2f} GB)")
-            else:
-                st.warning(f"No video files found in {folder}")
-                selected_video = None
-        else:
-            st.info("Enter a valid folder path above to see video files.")
-            selected_video = None
-
-    # A file was dragged in — save it to disk so the clipper can read it.
-    # (Streamlit holds the bytes in memory, not a path.)
+    # Drag a video file into the box, just like the logo uploader.
+    # Streamlit's default 200MB upload cap has been raised to 5GB in
+    # .streamlit/config.toml, so hour-long recordings work too.
+    uploaded = st.file_uploader(
+        "Drop a video file here",
+        type=["mp4", "mkv", "mov", "webm", "avi", "flv"],
+        key="local_video_uploader",
+        help="Drag a video file into this box. Works for files up to ~5GB.",
+    )
     if uploaded is not None:
         up_dir = os.path.join("C:\\AI-Stream-Clipper", "downloads")
         os.makedirs(up_dir, exist_ok=True)
@@ -153,6 +111,8 @@ else:
         selected_video = uploaded_video_path
         st.success(f"Dragged file: {uploaded.name} "
                    f"({len(uploaded.getbuffer()) / 1e6:.0f} MB)")
+    else:
+        selected_video = None
 
 # ─── Optional logo overlay ──────────────────────────────────────────────────
 logo_path = None
@@ -259,14 +219,11 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Cleanup: remove downloaded source videos and dragged uploads,
-    # but keep whatever folder path the user picked.
+    # Cleanup: remove the downloaded source video (but NOT the user's
+    # original file when they picked a local path)
     try:
         if source_mode == "Paste URL" and os.path.exists(video_file):
             os.remove(video_file)
             st.caption("🗑️  Downloaded source video cleaned up")
-        elif source_mode == "Choose local file" and uploaded_video_path is not None and os.path.exists(uploaded_video_path):
-            os.remove(uploaded_video_path)
-            st.caption("🗑️  Uploaded video cleaned up")
     except Exception:
         pass
