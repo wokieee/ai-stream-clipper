@@ -1,6 +1,9 @@
 import os
 import re
 import sys
+import json
+import time
+import urllib.request
 import whisper
 import moviepy.editor as mp
 from PIL import Image, ImageDraw, ImageFont
@@ -365,16 +368,149 @@ _TOPIC_WORDS = {
 }
 
 
+# ─── LLM helpers (optional — falls back gracefully when unavailable) ─────────
+_llm_timeout = 30
+_llm_base = os.environ.get("ANTHROPIC_BASE_URL", "http://localhost:3001")
+_llm_key = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
+# Haiku is fast, cheap, and handles formatting well — good for this
+# lightweight "write a title from a transcript" task.
+_llm_model = "claude-haiku-4-5"
+
+
+def _llm_model_id():
+    """Return the LLM model ID to use. Currently fixed to Haiku for speed."""
+    return _llm_model
+
+
+def _llm_title_tags(transcript_text, max_tokens=256):
+    """
+    Ask the LLM for a punchy title + hashtags directly from the transcript.
+
+    One-shot: give the transcript, get two lines back. No intermediate
+    summary step — that extra round-trip just gave the model more chances
+    to drift and emit chain-of-thought instead of the answer.
+    """
+    url = _llm_base + "/v1/chat/completions"
+    # Keep the transcript short — the model only needs the gist to write a
+    # good title, and a long transcript invites rambling.
+    preview = transcript_text[:400].replace("\n", " ").strip()
+    prompt = (
+        "Transcript: " + preview + "\n\n"
+        "Write a YouTube short title and hashtags for this clip. "
+        "Output EXACTLY two lines, nothing else:\n"
+        "TITLE: <4-8 word punchy title that captures what the clip is about>\n"
+        "TAGS: #word1 #word2 #word3 (3 hashtags matching the actual topic)"
+    )
+    payload = json.dumps({
+        "model": _llm_model_id(),
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload, headers={
+            "Content-Type": "application/json",
+            "x-api-key": _llm_key,
+            "anthropic-version": "2023-06-01",
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_llm_timeout) as r:
+            result = json.loads(r.read())
+        content = result["choices"][0]["message"]["content"].strip()
+        # Strip <thinking> tags and any chain-of-thought the model emitted
+        # before the final answer.
+        content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
+        title, tags = None, []
+        for line in content.splitlines():
+            line = line.strip()
+            # Match "TITLE: ..." or "Title: ..." — be tolerant of the model
+            # adding a leading dash, bullet, or number.
+            m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Ii][Tt][Ll][Ee]\s*[:\-]\s*(.+)$", line)
+            if m:
+                title = m.group(1).strip()
+                continue
+            m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Aa][Gg][Ss]\s*[:\-]\s*(.+)$", line)
+            if m:
+                tags = re.findall(r"#\w+", m.group(1))
+        # ── Reject garbage outputs ────────────────────────────────────────
+        # A throttled/low-quality backend sometimes echoes the prompt
+        # template back ("<4-8 word punchy title>", "#word1 #word2 #word3").
+        # Never let that reach the UI — the keyword fallback is better.
+        if title and ('<' in title or '>' in title
+                      or 'punchy title' in title.lower()
+                      or title.lower().startswith('#')):
+            title = None
+        placeholder_tags = {'#word1', '#word2', '#word3'}
+        tags = [t for t in tags if t.lower() not in placeholder_tags and len(t) > 2]
+        # Models love to add emojis (😱🔥) and ALL CAPS for "viral" energy.
+        # Strip both — they break on some platforms and ALL CAPS reads like
+        # a bot, not a real creator.
+        if title:
+            title = _strip_emoji(title)
+            title = " ".join(w.capitalize() if w.isupper() and len(w) > 1 else w
+                             for w in title.split())
+        return title, tags
+    except Exception:
+        # One retry after a short pause — the free proxy rate-limits
+        # aggressively and a 429 usually clears in a second or two.
+        try:
+            time.sleep(2)
+            with urllib.request.urlopen(req, timeout=_llm_timeout) as r:
+                result = json.loads(r.read())
+            content = result["choices"][0]["message"]["content"].strip()
+            content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
+            title, tags = None, []
+            for line in content.splitlines():
+                line = line.strip()
+                m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Ii][Tt][Ll][Ee]\s*[:\-]\s*(.+)$", line)
+                if m:
+                    title = m.group(1).strip()
+                    continue
+                m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Aa][Gg][Ss]\s*[:\-]\s*(.+)$", line)
+                if m:
+                    tags = re.findall(r"#\w+", m.group(1))
+            if title and ('<' in title or '>' in title
+                          or 'punchy title' in title.lower()
+                          or title.lower().startswith('#')):
+                title = None
+            placeholder_tags = {'#word1', '#word2', '#word3'}
+            tags = [t for t in tags if t.lower() not in placeholder_tags and len(t) > 2]
+            if title:
+                title = _strip_emoji(title)
+                title = " ".join(w.capitalize() if w.isupper() and len(w) > 1 else w
+                                 for w in title.split())
+            return title, tags
+        except Exception:
+            return None, []
+
+
+def _strip_emoji(text):
+    """Remove emoji characters and variation selectors from a string."""
+    return re.sub(
+        r"[\U0001F000-\U0001FAFF\U00002600-\U000027BF←-⇿⬀-⯿️‍]",
+        "", text
+    ).strip()
+
+
 def suggest_title_and_hashtags(text, min_words=15):
     """
     Generate a punchy title and hashtags from clip transcript text.
 
-    Title: scores candidate sentences for punchiness (4-9 words, viral
-    vocabulary, no filler), title-cases it, and trims to a clean phrase.
-    Hashtags: frequency-weighted, length-penalized-generic content words.
+    Uses an LLM to understand the clip's topic, then derives a title from
+    that understanding. Falls back to keyword scoring when the LLM is
+    unavailable.
     """
-    # Clean up transcript text
-    text = re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # ── LLM title + tags (soft-fail) ───────────────────────────────────────
+    # One-shot: give the transcript, get a title + hashtags back. The LLM
+    # actually understands the clip; the heuristics below just pick words.
+    llm_title, llm_tags = _llm_title_tags(text)
+    if llm_title:
+        print(f"  [LLM title] {llm_title}")
+    if llm_tags:
+        print(f"  [LLM tags]  {' '.join(llm_tags)}")
 
     # ── Title ──────────────────────────────────────────────────────────────
     # Whisper transcripts rarely have reliable sentence punctuation, so we
@@ -524,6 +660,17 @@ def suggest_title_and_hashtags(text, min_words=15):
     others = [w for w in ranked if w not in _TOPIC_WORDS]
     top = (topics + others[:1])[:5]
     hashtags = ['#Shorts', '#Viral', '#fyp'] + [w.capitalize() for w in top]
+
+    # ── LLM overrides the heuristic when it produced something usable ─────
+    # The LLM actually understands the clip; the heuristics just pick words.
+    # But only override when the LLM output looks sane — a broken title is
+    # worse than a mediocre one.
+    if llm_title and 3 <= len(llm_title.split()) <= 9 and len(llm_title) <= 60:
+        title = llm_title
+    if llm_tags:
+        clean = [t.lstrip('#') for t in llm_tags if len(t) > 1]
+        if clean:
+            hashtags = ['#Shorts', '#Viral', '#fyp'] + clean[:3]
     return {'title': title, 'hashtags': hashtags}
 
 
