@@ -84,21 +84,46 @@ st.markdown(
 # skip the download step entirely.
 source_mode = st.radio(
     "Video source",
-    options=["Paste URL", "Upload local file"],
+    options=["Paste URL", "Choose local file"],
     horizontal=True,
-    help="URL: YouTube / Twitch / etc. | Local: skip download, use a file on disk.",
+    help="URL: YouTube / Twitch / etc. | Local: pick a file already on disk — no size limit.",
 )
 
-url = ""
-uploaded_video = None
+if "selected_video_path" not in st.session_state:
+    st.session_state.selected_video_path = None
+
 if source_mode == "Paste URL":
     url = st.text_input("Paste Stream / Video URL (YouTube, Twitch, etc.)")
 else:
-    uploaded_video = st.file_uploader(
-        "Upload a video file",
-        type=["mp4", "mkv", "mov", "webm", "avi", "flv"],
-        help="Skips the download step — uses this file directly.",
-    )
+    # Use tkinter's native Windows file picker. It returns the file's
+    # PATH — the file is never uploaded or copied, so there is no size
+    # limit. An hour-long 5GB recording works fine. (Streamlit's own
+    # st.file_dialog is only available on 1.33+, and this version is 1.66.)
+    if st.button("📂 Choose video file..."):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.update_idletasks()
+            picked = filedialog.askopenfilename(
+                parent=root,
+                title="Choose a video file",
+                filetypes=[
+                    ("Video files", "*.mp4 *.mkv *.mov *.webm *.avi *.flv"),
+                    ("All files", "*.*"),
+                ],
+            )
+            root.destroy()
+            st.session_state.selected_video_path = picked or None
+        except Exception as e:
+            st.error(f"Could not open file picker: {e}")
+    selected_video = st.session_state.selected_video_path
+    if selected_video and os.path.exists(selected_video):
+        st.success(f"Selected: {selected_video} "
+                   f"({os.path.getsize(selected_video) / 1e9:.2f} GB)")
+    else:
+        selected_video = None
 
 # ─── Optional logo overlay ──────────────────────────────────────────────────
 logo_path = None
@@ -131,23 +156,19 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
     if source_mode == "Paste URL" and not url:
         st.warning("Please paste a valid video URL first.")
         st.stop()
-    if source_mode == "Upload local file" and uploaded_video is None:
-        st.warning("Please upload a video file first.")
+    if source_mode == "Choose local file" and selected_video is None:
+        st.warning("Please choose a video file first.")
         st.stop()
 
     with st.status("Processing video pipeline...", expanded=True) as status:
 
-        # Step 1: Get the video — download from URL, or use the uploaded file
+        # Step 1: Get the video — download from URL, or use the local file
         if source_mode == "Paste URL":
             status.write("⬇️  Downloading video...")
             video_file = clipper.download_video(url)
         else:
-            status.write("📁  Using uploaded video file...")
-            video_file = os.path.join(
-                "C:\\AI-Stream-Clipper", "downloads", uploaded_video.name
-            )
-            with open(video_file, "wb") as f:
-                f.write(uploaded_video.getbuffer())
+            status.write("📁  Reading local video file...")
+            video_file = selected_video  # path — no copy, no upload
 
         # Step 2: Transcribe
         status.write("🧠 Transcribing audio with Whisper AI...")
@@ -209,10 +230,11 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Cleanup: remove the source video after processing
+    # Cleanup: remove the downloaded source video (but NOT the user's
+    # original file when they picked a local path)
     try:
-        if os.path.exists(video_file):
+        if source_mode == "Paste URL" and os.path.exists(video_file):
             os.remove(video_file)
-            st.caption("🗑️  Source video cleaned up from downloads folder")
+            st.caption("🗑️  Downloaded source video cleaned up")
     except Exception:
         pass
