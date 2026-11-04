@@ -132,12 +132,24 @@ with st.expander("🏷️  Logo overlay (optional)", expanded=False):
         help="Transparent PNG works best. Placed bottom-right, ~18% of video width.",
     )
     if logo_upload is not None:
-        assets_dir = os.path.join("C:\\AI-Stream-Clipper", "assets")
-        os.makedirs(assets_dir, exist_ok=True)
-        logo_path = os.path.join(assets_dir, logo_upload.name)
-        with open(logo_path, "wb") as f:
-            f.write(logo_upload.getbuffer())
-        st.success(f"Logo saved: {logo_upload.name}")
+        # A logo is a small static image — anything much bigger than a
+        # few MB is a photo, not a watermark. Cap it here rather than
+        # letting a 50MB PNG through and then resizing it at render time.
+        logo_bytes = logo_upload.getbuffer()
+        if len(logo_bytes) > 2_000_000:
+            st.error(
+                f"Logo is too large ({len(logo_bytes)/1e6:.1f} MB). "
+                "Keep it under 2MB — a logo is a small static image, "
+                "not a photo. Try exporting it as a smaller PNG."
+            )
+        else:
+            assets_dir = os.path.join("C:\\AI-Stream-Clipper", "assets")
+            os.makedirs(assets_dir, exist_ok=True)
+            logo_path = os.path.join(assets_dir, logo_upload.name)
+            with open(logo_path, "wb") as f:
+                f.write(logo_bytes)
+            st.success(f"Logo saved: {logo_upload.name} "
+                       f"({len(logo_bytes)/1e6:.2f} MB)")
     else:
         # Also pick up a logo already sitting in the assets folder
         assets_dir = os.path.join("C:\\AI-Stream-Clipper", "assets")
