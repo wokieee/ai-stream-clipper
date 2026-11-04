@@ -89,40 +89,42 @@ source_mode = st.radio(
     help="URL: YouTube / Twitch / etc. | Local: pick a file already on disk — no size limit.",
 )
 
-if "selected_video_path" not in st.session_state:
-    st.session_state.selected_video_path = None
-
 if source_mode == "Paste URL":
     url = st.text_input("Paste Stream / Video URL (YouTube, Twitch, etc.)")
 else:
-    # Use tkinter's native Windows file picker. It returns the file's
-    # PATH — the file is never uploaded or copied, so there is no size
-    # limit. An hour-long 5GB recording works fine. (Streamlit's own
-    # st.file_dialog is only available on 1.33+, and this version is 1.66.)
-    if st.button("📂 Choose video file..."):
-        try:
-            import tkinter as tk
-            from tkinter import filedialog
-            root = tk.Tk()
-            root.withdraw()
-            root.update_idletasks()
-            picked = filedialog.askopenfilename(
-                parent=root,
-                title="Choose a video file",
-                filetypes=[
-                    ("Video files", "*.mp4 *.mkv *.mov *.webm *.avi *.flv"),
-                    ("All files", "*.*"),
-                ],
+    # Dropdown of video files on disk. The file is never uploaded or
+    # copied — the clipper reads it directly, so there is no size limit
+    # and an hour-long 5GB recording works fine.
+    # 1. Folder to scan (defaults to the downloads folder)
+    folder = st.text_input(
+        "Folder to scan",
+        value="C:\\AI-Stream-Clipper\\downloads",
+        help="Type or paste a folder path. The dropdown below lists every video file in it.",
+    )
+    # 2. Scan the folder for video files and populate the dropdown
+    video_exts = (".mp4", ".mkv", ".mov", ".webm", ".avi", ".flv")
+    if folder and os.path.isdir(folder):
+        videos = sorted(
+            os.path.join(folder, f)
+            for f in os.listdir(folder)
+            if f.lower().endswith(video_exts)
+        )
+        if videos:
+            labels = [f"{os.path.basename(v)} ({os.path.getsize(v)/1e6:.0f} MB)" for v in videos]
+            chosen = st.selectbox(
+                "Choose a video file",
+                options=videos,
+                format_func=lambda p: labels[videos.index(p)],
+                key="local_video_dropdown",
             )
-            root.destroy()
-            st.session_state.selected_video_path = picked or None
-        except Exception as e:
-            st.error(f"Could not open file picker: {e}")
-    selected_video = st.session_state.selected_video_path
-    if selected_video and os.path.exists(selected_video):
-        st.success(f"Selected: {selected_video} "
-                   f"({os.path.getsize(selected_video) / 1e9:.2f} GB)")
+            selected_video = chosen
+            st.success(f"Selected: {os.path.basename(chosen)} "
+                       f"({os.path.getsize(chosen)/1e9:.2f} GB)")
+        else:
+            st.warning(f"No video files found in {folder}")
+            selected_video = None
     else:
+        st.info("Enter a valid folder path above to see video files.")
         selected_video = None
 
 # ─── Optional logo overlay ──────────────────────────────────────────────────
