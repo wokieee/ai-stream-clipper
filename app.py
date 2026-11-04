@@ -45,7 +45,7 @@ with st.sidebar:
     st.header("⚙️ Settings")
 
     st.subheader("Clip Detection")
-    min_duration = st.slider("Min clip duration (s)", 5, 30, 10, 1)
+    min_duration = st.slider("Min clip duration (s)", 5, 60, 10, 1)
     max_duration = st.slider("Max clip duration (s)", 30, 120, 60, 5)
     max_clips = st.slider("Max clips to generate", 1, 10, 3, 1)
 
