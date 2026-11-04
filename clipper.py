@@ -666,7 +666,21 @@ def suggest_title_and_hashtags(text, min_words=15):
     # But only override when the LLM output looks sane — a broken title is
     # worse than a mediocre one.
     if llm_title and 3 <= len(llm_title.split()) <= 9 and len(llm_title) <= 60:
-        title = llm_title
+        # The LLM sometimes crams two punchy phrases together with a
+        # mid-title "!" ("New Update Broke Everything! Insane!"). Split on
+        # internal punctuation and keep the stronger half.
+        parts = re.split(r"[!?]", llm_title)
+        if len(parts) > 1:
+            best = max(parts, key=lambda p: len(p.split()))
+            title = best.strip()
+        else:
+            title = llm_title
+        # One trailing punctuation mark is fine; strip the rest.
+        title = title.rstrip(".,;:!?")
+        if title and title[-1] not in ".,;:!?":
+            title += "!"
+        if len(title) > 60:
+            title = title[:59].rsplit(" ", 1)[0].rstrip(".,;:!?") + "!"
     if llm_tags:
         clean = [t.lstrip('#') for t in llm_tags if len(t) > 1]
         if clean:
