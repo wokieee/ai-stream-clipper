@@ -390,84 +390,107 @@ _TOPIC_WORDS = {
 
 
 # ─── LLM helpers (optional — falls back gracefully when unavailable) ─────────
+# We try a chain of providers, in order:
+#   1. Ollama (localhost:11434) — your local gemma4:12b, no network, no rate
+#      limit, no free-token dependency. Best for reliability.
+#   2. freellmapi (localhost:3001) — unified router over free API tokens.
+#      Faster and better at formatting, but rate-limited.
+# Each is tried in turn; if one is down or throttled, we move on.
 _llm_timeout = 30
-_llm_base = os.environ.get("ANTHROPIC_BASE_URL", "http://localhost:3001")
-_llm_key = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-# "auto" routes through freellmapi's router, which picks a fast model that
-# actually follows formatting instructions. The named slots (haiku/opus)
-# tend to be thinking models that burn the token budget before reaching the
-# answer — auto has been reliable for this short, structured task.
-_llm_model = "auto"
-
-
-def _llm_model_id():
-    """Return the LLM model ID to use. Currently fixed to Haiku for speed."""
-    return _llm_model
+_llm_ollama_base = "http://localhost:11434"
+_llm_ollama_model = "gemma4-fast-claude:latest"
+_llm_freellmapi_base = os.environ.get("ANTHROPIC_BASE_URL", "http://localhost:3001")
+_llm_freellmapi_key = (os.environ.get("ANTHROPIC_API_KEY", "")
+                       or os.environ.get("ANTHROPIC_AUTH_TOKEN", ""))
+_llm_freellmapi_model = "auto"
 
 
 def _llm_title_tags(transcript_text, max_tokens=1024):
     """
     Ask the LLM for a punchy title + hashtags directly from the transcript.
 
-    One-shot: give the transcript, get two lines back. No intermediate
-    summary step — that extra round-trip just gave the model more chances
-    to drift and emit chain-of-thought instead of the answer.
+    Tries Ollama first (local, no rate limit, free), then freellmapi
+    (free tokens, better formatting). Falls back to None when both fail.
     """
-    url = _llm_base + "/v1/chat/completions"
-    # Keep the transcript short — the model only needs the gist to write a
-    # good title, and a long transcript invites rambling.
     preview = transcript_text[:400].replace("\n", " ").strip()
     prompt = (
-        "Transcript: " + preview + "\n\n"
-        "Write a YouTube short title and hashtags for this clip. "
-        "Output EXACTLY two lines, nothing else:\n"
-        "TITLE: <4-8 word punchy title that captures what the clip is about>\n"
-        "TAGS: #word1 #word2 #word3 (3 hashtags matching the actual topic)"
+        "Transcript: " + preview + "\n"
+        "Write a YouTube short title and hashtags for this clip.\n"
+        "Reply with exactly two lines:\n"
+        "TITLE: <punchy title that captures what the clip is about>\n"
+        "TAGS: #word1 #word2 #word3"
     )
+    # Provider 1: Ollama (local, think disabled to avoid reasoning overhead)
+    ollama_result = _try_ollama(prompt, max_tokens)
+    if ollama_result[0]:
+        print("  [LLM source] Ollama")
+        return ollama_result
+    print("  [LLM source] Ollama unavailable — trying freellmapi...")
+    # Provider 2: freellmapi (free tokens, better at strict formatting)
+    freellmapi_result = _try_freellmapi(prompt, max_tokens)
+    if freellmapi_result[0]:
+        print("  [LLM source] freellmapi")
+        return freellmapi_result
+    return None, []
+
+
+def _try_ollama(prompt, max_tokens):
+    """Call Ollama with think disabled. Returns (title, tags) or (None, [])."""
+    url = _llm_ollama_base + "/api/chat"
     payload = json.dumps({
-        "model": _llm_model_id(),
+        "model": _llm_ollama_model,
+        "think": False,
+        "stream": False,
+        "options": {"temperature": 0.3, "num_predict": max_tokens},
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=_llm_timeout * 3) as r:
+            result = json.loads(r.read())
+        content = result.get("message", {}).get("content", "").strip()
+        return _extract_title_tags(content)
+    except Exception:
+        return None, []
+
+
+def _try_freellmapi(prompt, max_tokens):
+    """Call freellmapi with the auto router. Returns (title, tags) or (None, [])."""
+    url = _llm_freellmapi_base + "/v1/chat/completions"
+    payload = json.dumps({
+        "model": _llm_freellmapi_model,
         "max_tokens": max_tokens,
         "temperature": 0.0,
-        # System prompt is critical: without it these models "think out
-        # loud" in their output and burn the token budget before reaching
-        # the answer.
         "system": "You output ONLY the final answer. Never think, reason, "
                   "or explain. Reply with exactly two lines.",
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
-    req = urllib.request.Request(
-        url, data=payload, headers={
-            "Content-Type": "application/json",
-            "x-api-key": _llm_key,
-            "anthropic-version": "2023-06-01",
-        }
-    )
+    req = urllib.request.Request(url, data=payload, headers={
+        "Content-Type": "application/json",
+        "x-api-key": _llm_freellmapi_key,
+        "anthropic-version": "2023-06-01",
+    })
     try:
-        return _parse_llm_title_tags(req, _llm_timeout)
+        with urllib.request.urlopen(req, timeout=_llm_timeout) as r:
+            result = json.loads(r.read())
+        choice = result.get("choices", [{}])[0]
+        content = choice.get("message", {}).get("content", "").strip()
+        # Strip thinking tags freellmapi sometimes emits
+        content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
+        return _extract_title_tags(content)
     except Exception:
-        # One retry after a short pause — the free proxy rate-limits
-        # aggressively and a 429 usually clears in a second or two.
-        try:
-            time.sleep(2)
-            return _parse_llm_title_tags(req, _llm_timeout * 2)
-        except Exception:
-            return None, []
+        return None, []
 
 
-def _parse_llm_title_tags(req, timeout):
-    """Send the prepared request and extract TITLE:/TAGS: lines."""
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        result = json.loads(r.read())
-    choice = result["choices"][0]
-    content = choice["message"]["content"].strip()
-    # Strip <thinking> tags and any chain-of-thought the model emitted
-    # before the final answer.
-    content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
+def _extract_title_tags(content):
+    """Parse TITLE: and TAGS: lines from an LLM response, with validation."""
+    if not content:
+        return None, []
     title, tags = None, []
     for line in content.splitlines():
         line = line.strip()
-        # Match "TITLE: ..." or "Title: ..." — be tolerant of the model
-        # adding a leading dash, bullet, or number.
         m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Ii][Tt][Ll][Ee]\s*[:\-]\s*(.+)$", line)
         if m:
             title = m.group(1).strip()
@@ -476,22 +499,19 @@ def _parse_llm_title_tags(req, timeout):
         if m:
             tags = re.findall(r"#\w+", m.group(1))
     # ── Reject garbage outputs ────────────────────────────────────────
-    # A throttled/low-quality backend sometimes echoes the prompt
-    # template back ("<4-8 word punchy title>", "#word1 #word2 #word3").
-    # Never let that reach the UI — the keyword fallback is better.
     if title and ('<' in title or '>' in title
                   or 'punchy title' in title.lower()
                   or title.lower().startswith('#')):
         title = None
     placeholder_tags = {'#word1', '#word2', '#word3'}
     tags = [t for t in tags if t.lower() not in placeholder_tags and len(t) > 2]
-    # Models love to add emojis (😱🔥) and ALL CAPS for "viral" energy.
-    # Strip both — they break on some platforms and ALL CAPS reads like
-    # a bot, not a real creator.
+    # Strip emojis and fix ALL CAPS words (Ollama and free proxies love them)
     if title:
         title = _strip_emoji(title)
         title = " ".join(w.capitalize() if w.isupper() and len(w) > 1 else w
                          for w in title.split())
+    # Normalize tag casing (e.g., #10k → #10K)
+    tags = [t[0] + t[1:].lower() if len(t) > 2 else t for t in tags]
     return title, tags
 
 
@@ -675,17 +695,16 @@ def suggest_title_and_hashtags(text, min_words=15):
     # The LLM actually understands the clip; the heuristics just pick words.
     # But only override when the LLM output looks sane — a broken title is
     # worse than a mediocre one.
-    if llm_title and 3 <= len(llm_title.split()) <= 9 and len(llm_title) <= 60:
+    if llm_title and 2 <= len(llm_title.split()) <= 9 and len(llm_title) <= 60:
         # The LLM sometimes crams two punchy phrases together with a
-        # mid-title "!" ("New Update Broke Everything! Insane!"). Split on
-        # internal punctuation and keep the stronger half.
+        # mid-title "!" ("10k Subs! We did it!"). Split on internal
+        # punctuation and keep the FIRST half — it's the headline, the
+        # second half is the follow-up. Then cap at one trailing "!".
         parts = re.split(r"[!?]", llm_title)
         if len(parts) > 1:
-            best = max(parts, key=lambda p: len(p.split()))
-            title = best.strip()
+            title = parts[0].strip()
         else:
             title = llm_title
-        # One trailing punctuation mark is fine; strip the rest.
         title = title.rstrip(".,;:!?")
         if title and title[-1] not in ".,;:!?":
             title += "!"
