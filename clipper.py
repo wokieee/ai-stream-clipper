@@ -372,9 +372,11 @@ _TOPIC_WORDS = {
 _llm_timeout = 30
 _llm_base = os.environ.get("ANTHROPIC_BASE_URL", "http://localhost:3001")
 _llm_key = os.environ.get("ANTHROPIC_API_KEY", "") or os.environ.get("ANTHROPIC_AUTH_TOKEN", "")
-# Haiku is fast, cheap, and handles formatting well — good for this
-# lightweight "write a title from a transcript" task.
-_llm_model = "claude-haiku-4-5"
+# "auto" routes through freellmapi's router, which picks a fast model that
+# actually follows formatting instructions. The named slots (haiku/opus)
+# tend to be thinking models that burn the token budget before reaching the
+# answer — auto has been reliable for this short, structured task.
+_llm_model = "auto"
 
 
 def _llm_model_id():
@@ -382,7 +384,7 @@ def _llm_model_id():
     return _llm_model
 
 
-def _llm_title_tags(transcript_text, max_tokens=256):
+def _llm_title_tags(transcript_text, max_tokens=1024):
     """
     Ask the LLM for a punchy title + hashtags directly from the transcript.
 
@@ -405,6 +407,11 @@ def _llm_title_tags(transcript_text, max_tokens=256):
         "model": _llm_model_id(),
         "max_tokens": max_tokens,
         "temperature": 0.0,
+        # System prompt is critical: without it these models "think out
+        # loud" in their output and burn the token budget before reaching
+        # the answer.
+        "system": "You output ONLY the final answer. Never think, reason, "
+                  "or explain. Reply with exactly two lines.",
         "messages": [{"role": "user", "content": prompt}],
     }).encode()
     req = urllib.request.Request(
@@ -415,74 +422,56 @@ def _llm_title_tags(transcript_text, max_tokens=256):
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=_llm_timeout) as r:
-            result = json.loads(r.read())
-        content = result["choices"][0]["message"]["content"].strip()
-        # Strip <thinking> tags and any chain-of-thought the model emitted
-        # before the final answer.
-        content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
-        title, tags = None, []
-        for line in content.splitlines():
-            line = line.strip()
-            # Match "TITLE: ..." or "Title: ..." — be tolerant of the model
-            # adding a leading dash, bullet, or number.
-            m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Ii][Tt][Ll][Ee]\s*[:\-]\s*(.+)$", line)
-            if m:
-                title = m.group(1).strip()
-                continue
-            m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Aa][Gg][Ss]\s*[:\-]\s*(.+)$", line)
-            if m:
-                tags = re.findall(r"#\w+", m.group(1))
-        # ── Reject garbage outputs ────────────────────────────────────────
-        # A throttled/low-quality backend sometimes echoes the prompt
-        # template back ("<4-8 word punchy title>", "#word1 #word2 #word3").
-        # Never let that reach the UI — the keyword fallback is better.
-        if title and ('<' in title or '>' in title
-                      or 'punchy title' in title.lower()
-                      or title.lower().startswith('#')):
-            title = None
-        placeholder_tags = {'#word1', '#word2', '#word3'}
-        tags = [t for t in tags if t.lower() not in placeholder_tags and len(t) > 2]
-        # Models love to add emojis (😱🔥) and ALL CAPS for "viral" energy.
-        # Strip both — they break on some platforms and ALL CAPS reads like
-        # a bot, not a real creator.
-        if title:
-            title = _strip_emoji(title)
-            title = " ".join(w.capitalize() if w.isupper() and len(w) > 1 else w
-                             for w in title.split())
-        return title, tags
+        return _parse_llm_title_tags(req, _llm_timeout)
     except Exception:
         # One retry after a short pause — the free proxy rate-limits
         # aggressively and a 429 usually clears in a second or two.
         try:
             time.sleep(2)
-            with urllib.request.urlopen(req, timeout=_llm_timeout) as r:
-                result = json.loads(r.read())
-            content = result["choices"][0]["message"]["content"].strip()
-            content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
-            title, tags = None, []
-            for line in content.splitlines():
-                line = line.strip()
-                m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Ii][Tt][Ll][Ee]\s*[:\-]\s*(.+)$", line)
-                if m:
-                    title = m.group(1).strip()
-                    continue
-                m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Aa][Gg][Ss]\s*[:\-]\s*(.+)$", line)
-                if m:
-                    tags = re.findall(r"#\w+", m.group(1))
-            if title and ('<' in title or '>' in title
-                          or 'punchy title' in title.lower()
-                          or title.lower().startswith('#')):
-                title = None
-            placeholder_tags = {'#word1', '#word2', '#word3'}
-            tags = [t for t in tags if t.lower() not in placeholder_tags and len(t) > 2]
-            if title:
-                title = _strip_emoji(title)
-                title = " ".join(w.capitalize() if w.isupper() and len(w) > 1 else w
-                                 for w in title.split())
-            return title, tags
+            return _parse_llm_title_tags(req, _llm_timeout * 2)
         except Exception:
             return None, []
+
+
+def _parse_llm_title_tags(req, timeout):
+    """Send the prepared request and extract TITLE:/TAGS: lines."""
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        result = json.loads(r.read())
+    choice = result["choices"][0]
+    content = choice["message"]["content"].strip()
+    # Strip <thinking> tags and any chain-of-thought the model emitted
+    # before the final answer.
+    content = re.sub(r"<thinking>.*?</thinking>\s*", "", content, flags=re.DOTALL).strip()
+    title, tags = None, []
+    for line in content.splitlines():
+        line = line.strip()
+        # Match "TITLE: ..." or "Title: ..." — be tolerant of the model
+        # adding a leading dash, bullet, or number.
+        m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Ii][Tt][Ll][Ee]\s*[:\-]\s*(.+)$", line)
+        if m:
+            title = m.group(1).strip()
+            continue
+        m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Aa][Gg][Ss]\s*[:\-]\s*(.+)$", line)
+        if m:
+            tags = re.findall(r"#\w+", m.group(1))
+    # ── Reject garbage outputs ────────────────────────────────────────
+    # A throttled/low-quality backend sometimes echoes the prompt
+    # template back ("<4-8 word punchy title>", "#word1 #word2 #word3").
+    # Never let that reach the UI — the keyword fallback is better.
+    if title and ('<' in title or '>' in title
+                  or 'punchy title' in title.lower()
+                  or title.lower().startswith('#')):
+        title = None
+    placeholder_tags = {'#word1', '#word2', '#word3'}
+    tags = [t for t in tags if t.lower() not in placeholder_tags and len(t) > 2]
+    # Models love to add emojis (😱🔥) and ALL CAPS for "viral" energy.
+    # Strip both — they break on some platforms and ALL CAPS reads like
+    # a bot, not a real creator.
+    if title:
+        title = _strip_emoji(title)
+        title = " ".join(w.capitalize() if w.isupper() and len(w) > 1 else w
+                         for w in title.split())
+    return title, tags
 
 
 def _strip_emoji(text):
