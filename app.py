@@ -92,6 +92,7 @@ source_mode = st.radio(
 if source_mode == "Paste URL":
     url = st.text_input("Paste Stream / Video URL (YouTube, Twitch, etc.)")
 else:
+    uploaded_video_path = None  # set only if a file was dragged in
     # Drag a video file into the box, just like the logo uploader.
     # Streamlit's default 200MB upload cap has been raised to 5GB in
     # .streamlit/config.toml, so hour-long recordings work too.
@@ -102,10 +103,16 @@ else:
         help="Drag a video file into this box. Works for files up to ~5GB.",
     )
     if uploaded is not None:
-        up_dir = os.path.join("C:\\AI-Stream-Clipper", "downloads")
+        # Streamlit only gives us the file's bytes, so a copy has to be
+        # written somewhere for the clipper to read it. But NOT into
+        # downloads/ — that folder already holds the source streams, and
+        # dropping a __upload_ copy next to a file of the same name just
+        # makes a duplicate. Use a separate temp folder instead; it is
+        # deleted after the run (see the cleanup block at the bottom).
+        up_dir = os.path.join("C:\\AI-Stream-Clipper", "tmp_uploads")
         os.makedirs(up_dir, exist_ok=True)
         base = os.path.basename(uploaded.name).replace("/", "_").replace("\\", "_")
-        uploaded_video_path = os.path.join(up_dir, f"__upload_{base}")
+        uploaded_video_path = os.path.join(up_dir, base)
         with open(uploaded_video_path, "wb") as f:
             f.write(uploaded.getbuffer())
         selected_video = uploaded_video_path
@@ -219,11 +226,19 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Cleanup: remove the downloaded source video (but NOT the user's
-    # original file when they picked a local path)
+    # Cleanup: remove the downloaded source video and the temp upload
+    # folder (but NOT the user's own file when they picked a local path)
     try:
         if source_mode == "Paste URL" and os.path.exists(video_file):
             os.remove(video_file)
             st.caption("🗑️  Downloaded source video cleaned up")
+        elif source_mode == "Choose local file" and uploaded_video_path is not None:
+            if os.path.exists(uploaded_video_path):
+                os.remove(uploaded_video_path)
+                st.caption("🗑️  Uploaded video cleaned up")
+            # Remove the temp folder if it is now empty
+            up_dir = os.path.dirname(uploaded_video_path)
+            if up_dir and os.path.isdir(up_dir) and not os.listdir(up_dir):
+                os.rmdir(up_dir)
     except Exception:
         pass
