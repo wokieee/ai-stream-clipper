@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import whisper
 import moviepy.editor as mp
 from PIL import Image, ImageDraw, ImageFont
@@ -7,6 +8,14 @@ import numpy as np
 import subprocess
 import uuid
 import cv2
+
+# Windows consoles default to cp1252 — emoji/status prints would crash on
+# encode. Force UTF-8 (with replacement) for stdout/stderr when possible.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 CLIPPER_DIR = "C:\\AI-Stream-Clipper"
@@ -219,47 +228,100 @@ doing have has had having would could should will can shall just really like
 know got go going gonna thing things yeah okay oh um uh ah well very much
 """.split())
 
+# Words that make a short title feel "viral" (curiosity / emotion / shock).
+_VIRAL_WORDS = {
+    'insane', 'crazy', 'shocked', 'unexpected', 'nobody', 'best', 'ultimate',
+    'secret', 'truth', 'believe', 'believes', 'incredible', 'unbelievable',
+    'wild', 'epic', 'legend', 'greatest', 'moment', 'funny', 'hilarious',
+    'satisfying', 'how', 'why', 'what', 'never', 'always', 'can', "can't",
+    'cannot', 'won', 'shocking', 'mind', 'blown', 'goat', 'win', 'fail',
+}
+
+# Broader stop list for hashtags — generic words that pollute tag clouds.
+_HASHTAG_STOP = _STOP_WORDS | {
+    'just', 'really', 'actually', 'literally', 'basically', 'probably',
+    'exactly', 'something', 'anything', 'everything', 'nothing', 'someone',
+    'anyone', 'everyone', 'thing', 'things', 'got', 'getting', 'know', 'make',
+    'made', 'even', 'still', 'also', 'only', 'own', 'same', 'such', 'than',
+    'too', 'very', 'well', 'back', 'after', 'first', 'last', 'see', 'seen',
+    'taking', 'take', 'put', 'gets', 'going', 'would', 'there', 'their',
+}
+
 
 def suggest_title_and_hashtags(text, min_words=15):
     """
     Generate a punchy title and hashtags from clip transcript text.
-    Heuristic: take the most substantial sentence, title-case it, and
-    extract frequent meaningful words for hashtags.
+
+    Title: scores candidate sentences for punchiness (4-9 words, viral
+    vocabulary, no filler), title-cases it, and trims to a clean phrase.
+    Hashtags: frequency-weighted, length-penalized-generic content words.
     """
     # Clean up transcript text
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # Pick a title: split into sentences, take the longest short-ish one,
-    # else the first min_words words
+    # ── Title ──────────────────────────────────────────────────────────────
     sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
-    sentences.sort(key=len, reverse=True)
-    title_src = ""
+    scored = []
     for s in sentences:
-        wc = len(s.split())
-        if 4 <= wc <= 12:
-            title_src = s
-            break
-    if not title_src:
-        title_src = " ".join(text.split()[:min(min_words, 10)])
+        words = s.split()
+        wc = len(words)
+        if wc < 3 or wc > 16:
+            continue
+        score = 0.0
+        # Prefer punchy 4-9 word lines
+        if 4 <= wc <= 9:
+            score += 2.5
+        elif wc <= 12:
+            score += 1.0
+        else:
+            score -= 1.0
+        # Viral vocabulary bonus
+        low = s.lower()
+        score += 0.6 * sum(1 for w in _VIRAL_WORDS if re.search(r'\b' + re.escape(w) + r'\b', low))
+        # Penalize leading filler
+        if any(w in ('um', 'uh', 'ah', 'like', 'so', 'you know', 'okay', 'yeah')
+               for w in words[:2]):
+            score -= 1.5
+        scored.append((score, s))
 
-    # Trim to ~60 chars at word boundary
-    if len(title_src) > 60:
-        title_src = title_src[:60].rsplit(' ', 1)[0]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored:
+        title_src = scored[0][1]
+        # If the "sentence" is really the whole unpunctuated clip, trim to a
+        # clean 8-word phrase instead of leaving a trailing fragment.
+        if len(title_src.split()) > 9:
+            title_src = " ".join(title_src.split()[:8])
+    else:
+        title_src = " ".join(text.split()[:min(min_words, 8)])
+
+    # Title case (short words stay lowercase except the first)
+    small = {'a', 'an', 'the', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'at',
+             'for', 'with', 'is', 'it', 'so', 'as', 'by', 'up', 'off', 'out', 'if'}
     words = title_src.split()
-    small = {'a','an','the','and','or','but','of','to','in','on','at','for','with','is','it','so'}
-    title_src = ' '.join(w if w.lower() in small else w[0].upper() + w[1:] if w else w
-                         for w in words)
-    title = title_src.rstrip('.,;:').strip()
+    titled = []
+    for i, w in enumerate(words):
+        wl = w.lower()
+        if wl in small and i != 0:
+            titled.append(wl)
+        elif w:
+            titled.append(w[0].upper() + w[1:])
+    title = ' '.join(titled).rstrip('.,;:').strip()
     if title:
         title = title[0].upper() + title[1:]
+    # Hard cap at ~52 chars at a word boundary
+    if len(title) > 52:
+        title = title[:52].rsplit(' ', 1)[0].rstrip('.,;:')
 
-    # Hashtags: frequency of meaningful words in whole clip
+    # ── Hashtags ───────────────────────────────────────────────────────────
     freq = {}
     for w in re.findall(r"[A-Za-z][A-Za-z0-9']+", text.lower()):
-        if w in _STOP_WORDS or len(w) < 4:
+        if w in _HASHTAG_STOP or len(w) < 4:
             continue
         freq[w] = freq.get(w, 0) + 1
-    top = sorted(freq, key=lambda w: freq[w], reverse=True)[:5]
+    # Weight by frequency but prefer specific (longer) words over generic ones
+    top = sorted(freq,
+                 key=lambda w: freq[w] * (1 + 0.25 * min(len(w) - 4, 6)),
+                 reverse=True)[:5]
     hashtags = ['#Shorts', '#Viral', '#fyp'] + [w.capitalize() for w in top]
     return {'title': title, 'hashtags': hashtags}
 
