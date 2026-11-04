@@ -946,7 +946,8 @@ def create_karaoke_image(full_text, highlight_word, word_index,
 
 # ─── Clip Creation ────────────────────────────────────────────────────────────
 def create_vertical_clip_with_captions(video_path, clip_info, transcript, output_filename,
-                                        chunk_size=4, outline=12, speaker_track=True):
+                                        chunk_size=4, outline=12, speaker_track=True,
+                                        logo_path=None):
     """
     Create a vertical (9:16) clip with karaoke-style captions.
     Each caption line shows a chunk of words; the currently-spoken word
@@ -963,6 +964,7 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
         chunk_size: Number of words per caption line (4-6 recommended)
         outline: Black outline thickness (8-15 recommended)
         speaker_track: Whether to track the speaker's face (default True)
+        logo_path: Path to a PNG/JPG logo overlay (optional)
 
     Returns:
         dict with 'path', 'title', 'hashtags' keys
@@ -1055,6 +1057,26 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
             txt_clips.append(txt_clip)
 
     final = mp.CompositeVideoClip(txt_clips)
+
+    # ── Optional logo overlay ─────────────────────────────────────────────
+    # A watermark in a corner helps brand your shorts without blocking the
+    # action. Scaled to ~18% of the video width and placed bottom-right with
+    # a small margin — visible but not obtrusive.
+    if logo_path and os.path.exists(logo_path):
+        try:
+            logo = mp.ImageClip(logo_path)
+            logo_w = int(video.w * 0.18)
+            logo_h = int(logo.h * (logo_w / max(logo.w, 1)))
+            logo = logo.resize((logo_w, logo_h))
+            margin = int(video.h * 0.03)
+            logo = logo.set_position(
+                ("right", video.h - margin - logo_h)
+            ).set_duration(clip_duration).set_start(0)
+            final = mp.CompositeVideoClip([final, logo])
+            print(f"  🏷️  Logo overlay added ({logo_w}x{logo_h})")
+        except Exception as e:
+            print(f"  ⚠️  Logo overlay failed ({e}), skipping")
+
     output_path = os.path.join(OUTPUT_DIR, output_filename)
     final.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=24, preset="medium")
 

@@ -2,6 +2,9 @@
 downloads/
 output/
 
+# Uploaded assets (logos, etc.) — user content, not code
+assets/
+
 # Python
 __pycache__/
 *.py[cod]

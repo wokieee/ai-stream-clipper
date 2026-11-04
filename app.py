@@ -79,18 +79,75 @@ st.markdown(
     "Turn long streams into viral, auto-captioned vertical shorts with karaoke-style word highlighting."
 )
 
-url = st.text_input("Paste Stream / Video URL (YouTube, Twitch, etc.)")
+# ─── Video source: URL or local file ────────────────────────────────────────
+# Paste a stream URL OR upload a video already on your computer. Local files
+# skip the download step entirely.
+source_mode = st.radio(
+    "Video source",
+    options=["Paste URL", "Upload local file"],
+    horizontal=True,
+    help="URL: YouTube / Twitch / etc. | Local: skip download, use a file on disk.",
+)
+
+url = ""
+uploaded_video = None
+if source_mode == "Paste URL":
+    url = st.text_input("Paste Stream / Video URL (YouTube, Twitch, etc.)")
+else:
+    uploaded_video = st.file_uploader(
+        "Upload a video file",
+        type=["mp4", "mkv", "mov", "webm", "avi", "flv"],
+        help="Skips the download step — uses this file directly.",
+    )
+
+# ─── Optional logo overlay ──────────────────────────────────────────────────
+logo_path = None
+with st.expander("🏷️  Logo overlay (optional)", expanded=False):
+    st.markdown("Add a small watermark to the bottom-right of every clip.")
+    logo_upload = st.file_uploader(
+        "Upload a logo (PNG / JPG)",
+        type=["png", "jpg", "jpeg", "gif", "webp"],
+        key="logo_uploader",
+        help="Transparent PNG works best. Placed bottom-right, ~18% of video width.",
+    )
+    if logo_upload is not None:
+        assets_dir = os.path.join("C:\\AI-Stream-Clipper", "assets")
+        os.makedirs(assets_dir, exist_ok=True)
+        logo_path = os.path.join(assets_dir, logo_upload.name)
+        with open(logo_path, "wb") as f:
+            f.write(logo_upload.getbuffer())
+        st.success(f"Logo saved: {logo_upload.name}")
+    else:
+        # Also pick up a logo already sitting in the assets folder
+        assets_dir = os.path.join("C:\\AI-Stream-Clipper", "assets")
+        if os.path.isdir(assets_dir):
+            existing = [f for f in os.listdir(assets_dir)
+                        if f.lower().endswith((".png", ".jpg", ".jpeg"))]
+            if existing:
+                logo_path = os.path.join(assets_dir, existing[0])
+                st.info(f"Using existing logo: {existing[0]}")
 
 if st.button("🚀 Process & Generate Clips", type="primary"):
-    if not url:
+    if source_mode == "Paste URL" and not url:
         st.warning("Please paste a valid video URL first.")
+        st.stop()
+    if source_mode == "Upload local file" and uploaded_video is None:
+        st.warning("Please upload a video file first.")
         st.stop()
 
     with st.status("Processing video pipeline...", expanded=True) as status:
 
-        # Step 1: Download
-        status.write("⬇️  Downloading video...")
-        video_file = clipper.download_video(url)
+        # Step 1: Get the video — download from URL, or use the uploaded file
+        if source_mode == "Paste URL":
+            status.write("⬇️  Downloading video...")
+            video_file = clipper.download_video(url)
+        else:
+            status.write("📁  Using uploaded video file...")
+            video_file = os.path.join(
+                "C:\\AI-Stream-Clipper", "downloads", uploaded_video.name
+            )
+            with open(video_file, "wb") as f:
+                f.write(uploaded_video.getbuffer())
 
         # Step 2: Transcribe
         status.write("🧠 Transcribing audio with Whisper AI...")
@@ -114,6 +171,7 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
                 chunk_size=chunk_size,
                 outline=outline,
                 speaker_track=speaker_track,
+                logo_path=logo_path,
             )
             rendered_clips.append(meta)
 
