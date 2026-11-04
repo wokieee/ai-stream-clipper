@@ -1080,7 +1080,23 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
             print(f"  ⚠️  Logo overlay failed ({e}), skipping")
 
     output_path = os.path.join(OUTPUT_DIR, output_filename)
-    final.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=24, preset="medium")
+    # WMP is picky about H.264: it chokes on High Profile and on yuv444p,
+    # reporting "unsupported encoding settings". Force Main profile +
+    # yuv420p (the format DVDs/phones use) and put the moov atom at the
+    # front so the file plays while it is still downloading.
+    final.write_videofile(
+        output_path,
+        codec="libx264",
+        audio_codec="aac",
+        fps=24,
+        preset="medium",
+        ffmpeg_params=[
+            "-profile:v", "main",
+            "-pix_fmt", "yuv420p",
+            "-level", "3.0",
+            "-movflags", "+faststart",
+        ],
+    )
 
     # Generate title & hashtags
     meta = suggest_title_and_hashtags(clip_info['text'])
