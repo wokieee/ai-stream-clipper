@@ -125,11 +125,17 @@ else:
 logo_path = None
 with st.expander("🏷️  Logo overlay (optional)", expanded=False):
     st.markdown("Add a small watermark to the bottom-right of every clip.")
+    # Streamlit's global upload cap is 5GB (set in config.toml for the
+    # video box), so the "max" shown next to this uploader is wrong.
+    # Enforce the real limit in code instead and state it plainly.
+    st.caption("⚠️  Logo must be under 2MB — a small static image, not a photo.")
     logo_upload = st.file_uploader(
         "Upload a logo (PNG / JPG)",
         type=["png", "jpg", "jpeg", "gif", "webp"],
         key="logo_uploader",
-        help="Transparent PNG works best. Placed bottom-right, ~18% of video width.",
+        help="Transparent PNG works best. Placed bottom-right, ~18% of "
+             "video width. Must be under 2MB — a logo is a small static "
+             "image, not a photo (export it as a smaller PNG if needed).",
     )
     if logo_upload is not None:
         # A logo is a small static image — anything much bigger than a
