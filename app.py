@@ -156,15 +156,10 @@ with st.expander("🏷️  Logo overlay (optional)", expanded=False):
                 f.write(logo_bytes)
             st.success(f"Logo saved: {logo_upload.name} "
                        f"({len(logo_bytes)/1e6:.2f} MB)")
-    else:
-        # Also pick up a logo already sitting in the assets folder
-        assets_dir = os.path.join("C:\\AI-Stream-Clipper", "assets")
-        if os.path.isdir(assets_dir):
-            existing = [f for f in os.listdir(assets_dir)
-                        if f.lower().endswith((".png", ".jpg", ".jpeg"))]
-            if existing:
-                logo_path = os.path.join(assets_dir, existing[0])
-                st.info(f"Using existing logo: {existing[0]}")
+    # No auto-load from the assets folder.
+    # Leftover logos from previous sessions would be picked up and applied
+    # unexpectedly, which is worse than starting fresh each time.
+    logo_path = None
 
 if st.button("🚀 Process & Generate Clips", type="primary"):
     if source_mode == "Paste URL" and not url:
