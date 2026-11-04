@@ -979,9 +979,13 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
     # Crop to 9:16 vertical
     w, h = video.size
     target_ratio = 9 / 16
-    new_w = h * target_ratio
-    x1 = (w - new_w) / 2
-    x2 = (w + new_w) / 2
+    # libx264 requires even width and height (1080x9/16 = 607.5 → 608).
+    # Round up to the nearest even number so the encoder is happy.
+    new_w = int(h * target_ratio)
+    if new_w % 2:
+        new_w += 1
+    x1 = (w - new_w) // 2
+    x2 = x1 + new_w
 
     # ── Speaker tracking: recenter on the person talking ──────────────────────
     if speaker_track:
@@ -990,12 +994,12 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
             track = build_speaker_track(video, sample_step=10)
             half = new_w / 2.0
             max_x1 = w - new_w
-            crop_w = int(new_w)
 
             def crop_fn(get_frame, t, _track=track):
                 frame = get_frame(t)
                 x1 = int(round(max(0.0, min(max_x1, _track(t) - half))))
-                return frame[:, x1:x1 + crop_w]
+                # Keep the crop width even — libx264 will reject odd widths.
+                return frame[:, x1:x1 + new_w]
 
             video = video.fl(crop_fn)
         except Exception as e:
