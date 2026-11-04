@@ -105,32 +105,53 @@ def download_video(url, run_id=None, min_height=1080):
         f"best[ext=mp4]/best"
     )
 
-    cmd = [
-        "yt-dlp",
-        "--js-runtimes", js_runtime,
-        "--remote-components", "ejs:github",
-        "-S", f"res:{min_height},vcodec:avc1,ext:mp4",
-        "-f", fmt,
-        "--merge-output-format", "mp4",
-        "-o", output_path,
-        url,
-    ] + cookies_arg
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError:
-        # Some videos don't have 1080p+ formats. Fall back to best available.
-        print("  ⚠️  1080p+ not available, falling back to best quality...")
-        cmd_fallback = [
+    # Try WITHOUT cookies first. Most videos don't need them, and a
+    # cookies.txt that was exported from the wrong browser/session (or is
+    # stale) can actually make things worse — yt-dlp sends those cookies
+    # and YouTube still hits the bot-check. Only fall back to cookies if
+    # the no-cookie attempt fails.
+    attempts = [
+        ("no cookies (fast path)", []),
+        ("with cookies", cookies_arg),
+    ]
+    last_err = None
+    last_stderr = ""
+    for label, cookies in attempts:
+        cmd = [
             "yt-dlp",
             "--js-runtimes", js_runtime,
             "--remote-components", "ejs:github",
-            "-f", "best[ext=mp4]/best",
+            "-S", f"res:{min_height},vcodec:avc1,ext:mp4",
+            "-f", fmt,
             "--merge-output-format", "mp4",
             "-o", output_path,
             url,
-        ] + cookies_arg
-        subprocess.run(cmd_fallback, check=True)
-    return output_path
+        ] + cookies
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+            # Echo yt-dlp's own progress lines so the UI isn't a black box
+            if proc.stderr:
+                tail = [ln for ln in proc.stderr.splitlines() if ln.strip()][-8:]
+                for ln in tail:
+                    print(f"    {ln}")
+            return output_path
+        except subprocess.CalledProcessError as e:
+            last_err = e
+            last_stderr = (e.stderr or "") if isinstance(e.stderr, str) else ""
+            if last_stderr:
+                print("  " + last_stderr.strip().splitlines()[-1])
+            print(f"  ⚠️  attempt failed ({label}) — trying next option...")
+
+    # Both attempts failed. If the error is the bot-check, give a clear
+    # hint instead of a raw traceback.
+    if "Sign in to confirm" in last_stderr or "not a bot" in last_stderr:
+        raise RuntimeError(
+            "YouTube bot-check blocked this video even with cookies. "
+            "Fix: open youtube.com in Chrome while logged in, export cookies "
+            "with the cookie extension, and save as C:\\AI-Stream-Clipper\\cookies.txt"
+        ) from last_err
+    raise last_err
 
 
 # ─── Transcription ────────────────────────────────────────────────────────────
