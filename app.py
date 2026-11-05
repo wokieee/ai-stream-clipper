@@ -58,7 +58,8 @@ with st.sidebar:
              "Subtitle: one clean line at a time with smooth fades, like anime subs.",
     )
     chunk_size = st.slider("Words per line", 3, 8, 5, 1)
-    outline = st.slider("Outline thickness", 6, 20, 6, 1)
+    outline = st.slider("Outline thickness", 2, 20, 6, 1)
+caption_size = st.slider("Caption font size", 40, 120, 72, 2)
 
     st.subheader("Framing")
     speaker_track = st.toggle(
@@ -213,6 +214,7 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
                 speaker_track=speaker_track,
                 logo_path=logo_path,
                 caption_style=caption_style.lower(),
+                font_size=caption_size,
             )
             rendered_clips.append(meta)
 

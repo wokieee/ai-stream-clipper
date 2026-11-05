@@ -988,59 +988,86 @@ def create_karaoke_image(full_text, highlight_word, word_index,
         font_size = int(img_height * 0.55)
 
     font = get_font(font_size)
-
-    # Auto-shrink if text is too wide
-    while font_size > 24:
-        bbox = draw.textbbox((0, 0), full_text, font=font)
-        if bbox[2] - bbox[0] < img_width - 30:
-            break
-        font_size -= 4
-        font = get_font(font_size)
+    usable_w = img_width - 40          # 20px margin each side
+    usable_h = img_height - 20
 
     words = full_text.split()
     if not words:
         return np.array(img)
 
-    # Measure each word's width and position
-    space_bbox = draw.textbbox((0, 0), " ", font=font)
-    space_w = space_bbox[2] - space_bbox[0]
+    # Wrap to as many lines as needed at this fixed font size. The old
+    # auto-shrink made the same caption jump between tiny and huge across
+    # clips, and could push text off-screen entirely.
+    lines = []
+    line_word_indices = []   # which original word indices are on this line
+    current = []
+    cur_idx = []
+    for i, w in enumerate(words):
+        candidate = current + [w]
+        trial = " ".join(candidate)
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= usable_w:
+            current = candidate
+            cur_idx.append(i)
+        else:
+            if current:
+                lines.append(" ".join(current))
+                line_word_indices.append(cur_idx)
+            current = [w]
+            cur_idx = [i]
+    if current:
+        lines.append(" ".join(current))
+        line_word_indices.append(cur_idx)
 
-    word_data = []
-    x = 0
-    for w in words:
-        wb = draw.textbbox((0, 0), w, font=font)
-        word_data.append({'word': w, 'x': x, 'width': wb[2] - wb[0]})
-        x += wb[2] - wb[0] + space_w
+    line_bboxes = [draw.textbbox((0, 0), ln, font=font) for ln in lines]
+    line_w = [b[2] - b[0] for b in line_bboxes]
+    line_h = [b[3] - b[1] for b in line_bboxes]
+    total_h = sum(line_h) + max(0, len(lines) - 1) * 8  # 8px line gap
+    start_y = (img_height - total_h) // 2
 
-    total_width = x - space_w  # remove trailing space
-    start_x = (img_width - total_width) // 2
+    # Find which line and x-position the highlighted word sits at
+    hx = hy = None
+    if 0 <= word_index < len(words):
+        for li, idxs in enumerate(line_word_indices):
+            if word_index in idxs:
+                pos_in_line = idxs.index(word_index)
+                line_words = lines[li].split()
+                x = 0
+                for j in range(pos_in_line):
+                    wb = draw.textbbox((0, 0), line_words[j], font=font)
+                    sb = draw.textbbox((0, 0), " ", font=font)
+                    x += (wb[2] - wb[0]) + (sb[2] - sb[0])
+                hx = (img_width - line_w[li]) // 2 + x
+                hy = start_y + sum(line_h[:li]) + li * 8
+                break
 
-    text_bbox = draw.textbbox((0, 0), full_text, font=font)
-    text_h = text_bbox[3] - text_bbox[1]
-    ty = (img_height - text_h) // 2
+    # Thick black outline for every line
+    for i, ln in enumerate(lines):
+        x = (img_width - line_w[i]) // 2
+        y = start_y + sum(line_h[:i]) + i * 8
+        for dx in range(-outline, outline + 1):
+            for dy in range(-outline, outline + 1):
+                if dx * dx + dy * dy <= outline * outline:
+                    draw.text((x + dx, y + dy), ln, font=font,
+                              fill=(0, 0, 0, 255))
 
-    # Draw thick black outline for the full line
-    for dx in range(-outline, outline + 1):
-        for dy in range(-outline, outline + 1):
-            if dx * dx + dy * dy <= outline * outline:
-                draw.text((start_x + dx, ty + dy), full_text, font=font,
-                          fill=(0, 0, 0, 255))
+    # White fill for every line
+    for i, ln in enumerate(lines):
+        x = (img_width - line_w[i]) // 2
+        y = start_y + sum(line_h[:i]) + i * 8
+        draw.text((x, y), ln, font=font, fill=normal_color)
 
-    # Draw full line in white
-    draw.text((start_x, ty), full_text, font=font, fill=normal_color)
-
-    # Draw highlighted word in yellow on top (with its own outline)
-    if 0 <= word_index < len(word_data):
-        wd = word_data[word_index]
-        hx = start_x + wd['x']
+    # Highlighted word in yellow on top (with its own outline)
+    if hx is not None:
+        wd = words[word_index]
         # Extra-thick outline for the highlighted word for extra pop
         word_outline = outline + 3
         for dx in range(-word_outline, word_outline + 1):
             for dy in range(-word_outline, word_outline + 1):
                 if dx * dx + dy * dy <= word_outline * word_outline:
-                    draw.text((hx + dx, ty + dy), wd['word'], font=font,
+                    draw.text((hx + dx, hy + dy), wd, font=font,
                               fill=(0, 0, 0, 255))
-        draw.text((hx, ty), wd['word'], font=font, fill=highlight_color)
+        draw.text((hx, hy), wd, font=font, fill=highlight_color)
 
     return np.array(img)
 
@@ -1059,37 +1086,59 @@ def create_subtitle_image(text, img_width, img_height, font_size=None,
         font_size = int(img_height * 0.55)
 
     font = get_font(font_size)
+    usable_w = img_width - 40          # 20px margin each side
+    usable_h = img_height - 20
 
-    # Auto-shrink if the line is too wide
-    while font_size > 24:
-        bbox = draw.textbbox((0, 0), text, font=font)
-        if bbox[2] - bbox[0] < img_width - 30:
-            break
-        font_size -= 4
-        font = get_font(font_size)
+    # Wrap to as many lines as needed so the text always fits at this
+    # fixed font size. Shrinking the font to fit was what made captions
+    # jump between tiny and huge, and occasionally push text off-screen.
+    words = text.split()
+    lines = []
+    current = []
+    for w in words:
+        candidate = current + [w]
+        trial = " ".join(candidate)
+        bbox = draw.textbbox((0, 0), trial, font=font)
+        if bbox[2] - bbox[0] <= usable_w:
+            current = candidate
+        else:
+            if current:
+                lines.append(" ".join(current))
+            current = [w]
+    if current:
+        lines.append(" ".join(current))
 
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_w = bbox[2] - bbox[0]
-    text_h = bbox[3] - bbox[1]
-    start_x = (img_width - text_w) // 2
-    ty = (img_height - text_h) // 2
+    line_bboxes = [draw.textbbox((0, 0), ln, font=font) for ln in lines]
+    line_w = [b[2] - b[0] for b in line_bboxes]
+    line_h = [b[3] - b[1] for b in line_bboxes]
+    total_h = sum(line_h) + max(0, len(lines) - 1) * 8  # 8px line gap
 
-    # Thick black outline
-    for dx in range(-outline, outline + 1):
-        for dy in range(-outline, outline + 1):
-            if dx * dx + dy * dy <= outline * outline:
-                draw.text((start_x + dx, ty + dy), text, font=font,
-                          fill=(0, 0, 0, 255))
+    # Center the whole block in the caption box
+    start_y = (img_height - total_h) // 2
+
+    # Thick black outline for every line
+    for i, ln in enumerate(lines):
+        x = (img_width - line_w[i]) // 2
+        y = start_y + sum(line_h[:i]) + i * 8
+        for dx in range(-outline, outline + 1):
+            for dy in range(-outline, outline + 1):
+                if dx * dx + dy * dy <= outline * outline:
+                    draw.text((x + dx, y + dy), ln, font=font,
+                              fill=(0, 0, 0, 255))
 
     # White fill
-    draw.text((start_x, ty), text, font=font, fill=color)
+    for i, ln in enumerate(lines):
+        x = (img_width - line_w[i]) // 2
+        y = start_y + sum(line_h[:i]) + i * 8
+        draw.text((x, y), ln, font=font, fill=color)
     return np.array(img)
 
 
 # ─── Clip Creation ────────────────────────────────────────────────────────────
 def create_vertical_clip_with_captions(video_path, clip_info, transcript, output_filename,
                                         chunk_size=4, outline=12, speaker_track=True,
-                                        logo_path=None, caption_style="karaoke"):
+                                        logo_path=None, caption_style="karaoke",
+                                        font_size=72):
     """
     Create a vertical (9:16) clip with captions.
 
@@ -1109,7 +1158,12 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
         transcript: Whisper transcript result
         output_filename: Output filename
         chunk_size: Number of words per caption line (4-6 recommended)
-        outline: Black outline thickness (6-20 recommended)
+        outline: Black outline thickness (2-20 recommended)
+        font_size: Fixed caption font size in pixels (40-120). The old
+            code scaled it as a fraction of video height, so the same text
+            rendered at very different sizes on different clips — small on
+            some frames, so big it spilled off-screen on others. A fixed
+            size keeps every caption legible and inside the frame.
         speaker_track: Whether to track the speaker's face (default True)
         logo_path: Path to a PNG/JPG logo overlay (optional)
         caption_style: "karaoke" or "subtitle" (default "karaoke")
@@ -1176,9 +1230,13 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
         word_list = [{'word': clip_info['text'], 'start': 0, 'end': clip_duration}]
 
     # Build caption clips
-    caption_height = int(h * 0.25)
+    # Fixed sizes, not fractions of height. A fixed font size keeps every
+    # caption the same size regardless of source resolution, and the box
+    # is tall enough for two lines so wrapping never pushes text off-screen.
+    caption_height = 300
     caption_y = int(h * 0.62)
-    font_size = int(h * 0.10)
+    if caption_y + caption_height > h:
+        caption_y = max(0, h - caption_height)
     txt_clips = [video]
 
     # Two caption styles:
