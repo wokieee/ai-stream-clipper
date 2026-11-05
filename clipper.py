@@ -1319,6 +1319,30 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
     x1 = (w - new_w) // 2
     x2 = x1 + new_w
 
+    # ── Zoom-out helper ──────────────────────────────────────────────────
+    # A full-height 9:16 crop is the TIGHTEST possible framing — the person
+    # fills the whole frame, which read as "zoomed in too much". Zooming out
+    # properly means showing more of the scene, but a plain wider crop can't
+    # be 9:16 at the same time. The standard shorts technique: shrink the
+    # subject crop to ZOOM of frame size and composite it over a blurred,
+    # stretched copy of the same frame that fills 9:16. The person gets
+    # smaller (context around them is visible) with no distortion, and the
+    # blurred border looks intentional instead of like letterboxing.
+    ZOOM = 0.82
+
+    def zoom_out(strip):
+        fh, fw = strip.shape[:2]
+        sw, sh = int(fw * ZOOM), int(fh * ZOOM)
+        # Keep even dims — the composite is re-encoded by libx264.
+        sw -= sw % 2
+        sh -= sh % 2
+        small = cv2.resize(strip, (sw, sh), interpolation=cv2.INTER_AREA)
+        bg = cv2.resize(strip, (fw, fh), interpolation=cv2.INTER_AREA)
+        bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=28)
+        ox, oy = (fw - sw) // 2, (fh - sh) // 2
+        bg[oy:oy + sh, ox:ox + sw] = small
+        return bg
+
     # ── Speaker tracking: recenter on the person talking ──────────────────────
     if speaker_track:
         print("  🎯 Detecting speaker position (face tracking)...")
@@ -1331,14 +1355,16 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
                 frame = get_frame(t)
                 x1 = int(round(max(0.0, min(max_x1, _track(t) - half))))
                 # Keep the crop width even — libx264 will reject odd widths.
-                return frame[:, x1:x1 + new_w]
+                return zoom_out(frame[:, x1:x1 + new_w])
 
             video = video.fl(crop_fn)
         except Exception as e:
             print(f"  ⚠️  Face tracking failed ({e}), using static center crop")
-            video = video.crop(x1=x1, x2=x2, y1=0, y2=h)
+            video = video.crop(x1=x1, x2=x2, y1=0, y2=h).fl(
+                lambda gf, t: zoom_out(gf(t)))
     else:
-        video = video.crop(x1=x1, x2=x2, y1=0, y2=h)
+        video = video.crop(x1=x1, x2=x2, y1=0, y2=h).fl(
+            lambda gf, t: zoom_out(gf(t)))
 
     clip_start = clip_info['start']
     clip_end = clip_info['end']

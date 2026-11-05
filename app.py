@@ -259,34 +259,42 @@ if results:
     for i, meta in enumerate(rendered_clips):
         path = meta['path']
         clip_info = viral_clips[i]
-        st.markdown(f'<div class="clip-card">', unsafe_allow_html=True)
-        col_video, col_meta = st.columns([2, 1])
+        # NOTE: no raw <div> wrapper here. Streamlit wraps every
+        # st.markdown(..., unsafe_allow_html=True) block in its OWN
+        # <div class="stMarkdown">, so a hand-written <div>...</div> pair
+        # across several markdown calls opened more wrappers than it
+        # closed — leaving a stray </div> at the bottom of the page.
+        # Streamlit's containers (st.container / st.columns) manage their
+        # own DOM, so we use those for card structure and keep HTML only
+        # for the small styled spans inside the suggestion box.
+        with st.container():
+            col_video, col_meta = st.columns([3, 1])
 
-        with col_video:
-            # Full-width preview inside the card — the old 240px-wide
-            # thumbnail in a narrow column looked tiny and left the card
-            # half empty.
-            st.video(path)
-            with open(path, "rb") as f:
-                st.download_button(
-                    label=f"⬇️  Download Clip {i+1}",
-                    data=f,
-                    file_name=os.path.basename(path),
-                    mime="video/mp4",
-                    key=f"dl_{i}",
+            with col_video:
+                # Fixed 260px, not column-width. st.video() with no width
+                # fills its column, which made the preview huge. 260px is
+                # compact like the original thumbnail and scales no matter
+                # how wide the window is.
+                st.video(path, width=260)
+                with open(path, "rb") as f:
+                    st.download_button(
+                        label=f"⬇️  Download Clip {i+1}",
+                        data=f,
+                        file_name=os.path.basename(path),
+                        mime="video/mp4",
+                        key=f"dl_{i}",
+                    )
+
+            with col_meta:
+                st.markdown("**💡 Title Suggestion**")
+                st.markdown(
+                    f'<span class="title-text">{meta["title"]}</span>',
+                    unsafe_allow_html=True,
                 )
-
-        with col_meta:
-            st.markdown(f'<div class="suggestion-box">', unsafe_allow_html=True)
-            st.markdown("**💡 Title Suggestion**")
-            st.markdown(f'<p class="title-text">{meta["title"]}</p>', unsafe_allow_html=True)
-            st.markdown("**🏷️ Hashtags**")
-            st.markdown(f'<p class="hashtags">{" ".join(meta["hashtags"])}</p>', unsafe_allow_html=True)
-            st.markdown(f'**Duration:** {clip_info["end"] - clip_info["start"]:.0f}s')
-            st.markdown(f'**Score:** {clip_info["score"]:.2f}')
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        # Card close tag goes LAST, after both columns have rendered —
-        # putting it inside a column left an unbalanced </div> at the
-        # bottom of the page.
-        st.markdown('</div>')
+                st.markdown("**🏷️ Hashtags**")
+                st.markdown(
+                    f'<span class="hashtags">{" ".join(meta["hashtags"])}</span>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f'**Duration:** {clip_info["end"] - clip_info["start"]:.0f}s')
+                st.markdown(f'**Score:** {clip_info["score"]:.2f}')
