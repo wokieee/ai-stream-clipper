@@ -1402,40 +1402,50 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
         # Group words into chunks, one visible line per chunk. Each chunk
         # is a single ImageClip with a fade-in/fade-out so there are no
         # hard cuts between words and no lag between frames.
+        #
+        # Caption handoff rule (both styles): each clip owns the gap until
+        # the NEXT clip starts, PLUS the fade duration.
+        #
+        # Why +fade: crossfadein/crossfadeout only set the mask alpha, they
+        # do NOT lengthen the clip. If A ended exactly at B's start, that
+        # instant has A's alpha=0 (fade-out done) AND B's alpha=0 (fade-in
+        # just started) — a frame with no caption at all. Extending A by the
+        # fade duration makes the two alphas sum to 1 across the handoff:
+        # A fades out as B fades in.
+        #
+        # That is also what stops the merge. The old code added a fixed
+        # +0.12s to every clip, so two adjacent captions were BOTH fully
+        # opaque for 0.12s — the whole line showed twice and the captions
+        # merged into a jumble. Now the only overlap is the fade itself,
+        # where one is already dimming as the other brightens.
         for chunk_idx in range(0, len(word_list), chunk_size):
-            chunk = word_list[chunk_idx:chunk_idx + chunk_size]
-            chunk_text = " ".join(w['word'] for w in chunk)
-            chunk_start = chunk[0]['start']
-            chunk_end = chunk[-1]['end']
-            # End BEFORE the next chunk starts. The old code set
-            # duration = max(0.3, chunk_end - chunk_start), so a short chunk
-            # (fast speaker, few words) stretched to swallow the next chunk's
-            # start time — the two subtitle images overlapped and merged
-            # into one jumble. Each line now owns its own time window.
-            next_start = (word_list[chunk_idx + chunk_size]['start']
-                          if chunk_idx + chunk_size < len(word_list)
-                          else clip_duration)
-            duration = min(chunk_end - chunk_start, next_start - chunk_start)
-            duration = max(0.15, duration)
+                chunk = word_list[chunk_idx:chunk_idx + chunk_size]
+                chunk_text = " ".join(w['word'] for w in chunk)
+                chunk_start = chunk[0]['start']
+                chunk_end = chunk[-1]['end']
+                next_start = (word_list[chunk_idx + chunk_size]['start']
+                              if chunk_idx + chunk_size < len(word_list)
+                              else clip_duration)
+                duration = max(0.1, next_start - chunk_start + 0.05)
 
-            img_np = create_subtitle_image(
-                chunk_text,
-                img_width=int(video.w),
-                img_height=caption_height,
-                font_size=font_size,
-                outline=outline,
-            )
-            txt_clip = mp.ImageClip(img_np, transparent=True)
-            # Fade in/out so transitions are smooth, not hard cuts.
-            txt_clip = txt_clip.set_start(chunk_start).set_duration(duration)
-            txt_clip = txt_clip.crossfadein(0.12).crossfadeout(0.12)
-            txt_clip = txt_clip.set_position(('center', caption_y))
-            txt_clips.append(txt_clip)
+                img_np = create_subtitle_image(
+                    chunk_text,
+                    img_width=int(video.w),
+                    img_height=caption_height,
+                    font_size=font_size,
+                    outline=outline,
+                )
+                txt_clip = mp.ImageClip(img_np, transparent=True)
+                txt_clip = txt_clip.set_start(chunk_start).set_duration(duration)
+                txt_clip = txt_clip.crossfadein(0.05).crossfadeout(0.05)
+                txt_clip = txt_clip.set_position(('center', caption_y))
+                txt_clips.append(txt_clip)
     else:
-        # Karaoke: one ImageClip per word, but each clip is long enough to
-        # overlap the next word. Previously each word's clip ended exactly
-        # at its end time, leaving a gap where no frame was rendered —
-        # that gap is what caused the lag and the "said/done" bleed.
+        # Karaoke: one ImageClip per word. Each clip owns the gap until the
+        # next word starts, PLUS the fade duration (see the handoff rule
+        # above). The old code added a fixed +0.12s to every word, which
+        # made two adjacent words both fully opaque for 0.12s — the whole
+        # line showed twice and merged.
         for chunk_idx in range(0, len(word_list), chunk_size):
             chunk = word_list[chunk_idx:chunk_idx + chunk_size]
             chunk_text = " ".join(w['word'] for w in chunk)
@@ -1443,15 +1453,18 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
             for word_pos, w in enumerate(chunk):
                 word_start = w['start']
                 word_end = w['end']
-                # Hold each word for at least 0.15s and let it overlap the
-                # next word by 0.12s so no frame gap ever occurs.
-                duration = max(0.15, (word_end - word_start) + 0.12)
-                # But never let a word's clip run past the START of the next
-                # word — otherwise two different captions overlap and merge
-                # into a jumble (the "captions still merge" symptom).
                 if word_pos + 1 < len(chunk):
                     next_word_start = chunk[word_pos + 1]['start']
-                    duration = min(duration, next_word_start - word_start + 0.12)
+                else:
+                    # Last word of the chunk must reach the NEXT chunk's
+                    # first word, not just this chunk's end. Otherwise a
+                    # 0.05–0.35s gap opens at every chunk boundary (a
+                    # frame with no caption at all).
+                    next_idx = chunk_idx + chunk_size
+                    next_word_start = (word_list[next_idx]['start']
+                                       if next_idx < len(word_list)
+                                       else chunk_end)
+                duration = max(0.1, next_word_start - word_start + 0.05)
 
                 img_np = create_karaoke_image(
                     chunk_text,
@@ -1464,6 +1477,7 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
                 )
                 txt_clip = mp.ImageClip(img_np, transparent=True)
                 txt_clip = txt_clip.set_start(word_start).set_duration(duration)
+                txt_clip = txt_clip.crossfadein(0.05).crossfadeout(0.05)
                 txt_clip = txt_clip.set_position(('center', caption_y))
                 txt_clips.append(txt_clip)
 
