@@ -98,31 +98,44 @@ def download_video(url, run_id=None, min_height=1080):
     cookies_file = os.path.join(CLIPPER_DIR, "cookies.txt")
     cookies_arg = _cookies_args()
 
-    # Format spec: prefer 1080p+ mp4, fall back to best available
+    # Format spec: prefer 1080p+ mp4, fall back to best available.
+    # EVERY fallback keeps the height constraint. The old spec ended with
+    # "best[ext=mp4]/best", which have NO height floor — so when no 1080p
+    # existed it silently grabbed a 360p/480p file. That was the low-quality
+    # download bug.
     fmt = (
         f"bestvideo[height>={min_height}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"bestvideo[height>={min_height}]/best[height>={min_height}]/"
-        f"best[ext=mp4]/best"
+        f"bestvideo[height>={min_height}]+bestaudio/"
+        f"best[height>={min_height}][ext=mp4]/"
+        f"best[height>={min_height}]"
     )
 
-    # Try WITHOUT cookies first. Most videos don't need them, and a
-    # cookies.txt that was exported from the wrong browser/session (or is
-    # stale) can actually make things worse — yt-dlp sends those cookies
-    # and YouTube still hits the bot-check. Only fall back to cookies if
-    # the no-cookie attempt fails.
-    attempts = [
-        ("no cookies (fast path)", []),
-        ("with cookies", cookies_arg),
-    ]
+    # Try WITH cookies first when we have them. An authenticated session
+    # often unlocks higher-quality formats and skips the bot-check
+    # entirely. Only fall back to no-cookies if the cookie attempt fails
+    # (a stale cookies.txt can make things worse, not better).
+    if cookies_arg:
+        attempts = [
+            ("with cookies", cookies_arg, fmt),
+            ("no cookies (fallback)", [], fmt),
+        ]
+    else:
+        attempts = [("no cookies", [], fmt)]
+
+    # Some videos genuinely don't have 1080p. Rather than failing, retry
+    # once with no height floor — but say out loud what quality we're
+    # actually getting, so a low-quality download is never silent.
+    fmt_any = "bestvideo+bestaudio/best"
+    attempts.append(("no 1080p exists — best available", [], fmt_any))
     last_err = None
     last_stderr = ""
-    for label, cookies in attempts:
+    for label, cookies, current_fmt in attempts:
         cmd = [
             "yt-dlp",
             "--js-runtimes", js_runtime,
             "--remote-components", "ejs:github",
             "-S", f"res:{min_height},vcodec:avc1,ext:mp4",
-            "-f", fmt,
+            "-f", current_fmt,
             "--merge-output-format", "mp4",
             "-o", output_path,
             url,
@@ -135,6 +148,26 @@ def download_video(url, run_id=None, min_height=1080):
                 tail = [ln for ln in proc.stderr.splitlines() if ln.strip()][-8:]
                 for ln in tail:
                     print(f"    {ln}")
+            # If we fell through to the no-height-floor fallback, report
+            # the actual resolution so a low-quality download is visible.
+            # yt-dlp prints "Downloading ... 720p" in its log, so we can
+            # read it back instead of shelling out to ffprobe (which is
+            # not on PATH on this machine).
+            if "no 1080p exists" in label:
+                try:
+                    log_text = (proc.stderr or "") + (proc.stdout or "")
+                    res_match = re.search(
+                        r"Downloading\s+\"[^\"]*\"\s+to\s+.*?(\d{3,4}[pPi])",
+                        log_text,
+                    )
+                    if res_match:
+                        print(f"  ⚠️  This video has no {min_height}p — "
+                              f"downloaded {res_match.group(1)} instead.")
+                    else:
+                        print(f"  ⚠️  This video has no {min_height}p — "
+                              f"downloaded the best available format.")
+                except Exception:
+                    pass
             return output_path
         except subprocess.CalledProcessError as e:
             last_err = e
@@ -149,15 +182,12 @@ def download_video(url, run_id=None, min_height=1080):
         raise RuntimeError(
             "YouTube blocked this download with its bot-check "
             "('Sign in to confirm you are not a bot').\n\n"
-            "The app could not pull cookies automatically because Chrome "
-            "locks its cookie file while it is running, and yt-dlp cannot "
-            "decrypt them when Chrome is closed.\n\n"
             "Fix (one-time, ~30 seconds):\n"
             "  1. Install the 'Get cookies.txt LOCALLY' Chrome extension.\n"
             "  2. Open youtube.com in Chrome while logged in.\n"
             "  3. Click the extension, then 'Export'.\n"
             "  4. Save the file as C:\\AI-Stream-Clipper\\cookies.txt\n\n"
-            "After that, every YouTube download works without any further setup."
+            "After that, every YouTube download works without further setup."
         ) from last_err
     raise last_err
 
