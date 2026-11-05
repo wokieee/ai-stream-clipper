@@ -46,13 +46,19 @@ with st.sidebar:
 
     st.subheader("Clip Detection")
     min_duration = st.slider("Min clip duration (s)", 5, 60, 10, 1)
-    max_duration = st.slider("Max clip duration (s)", 30, 120, 60, 5)
+    max_duration = st.slider("Max clip duration (s)", 60, 120, 60, 5)
     max_clips = st.slider("Max clips to generate", 1, 10, 3, 1)
 
     st.subheader("Caption Style")
-    st.markdown("*Karaoke — word pops as spoken*")
+    caption_style = st.radio(
+        "Style",
+        options=["Karaoke", "Subtitle"],
+        horizontal=True,
+        help="Karaoke: word pops yellow as spoken (Hormozi style). "
+             "Subtitle: one clean line at a time with smooth fades, like anime subs.",
+    )
     chunk_size = st.slider("Words per line", 3, 8, 5, 1)
-    outline = st.slider("Outline thickness", 6, 20, 12, 1)
+    outline = st.slider("Outline thickness", 6, 20, 6, 1)
 
     st.subheader("Framing")
     speaker_track = st.toggle(
@@ -202,6 +208,7 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
                 outline=outline,
                 speaker_track=speaker_track,
                 logo_path=logo_path,
+                caption_style=caption_style.lower(),
             )
             rendered_clips.append(meta)
 

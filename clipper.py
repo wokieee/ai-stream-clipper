@@ -946,14 +946,60 @@ def create_karaoke_image(full_text, highlight_word, word_index,
     return np.array(img)
 
 
+def create_subtitle_image(text, img_width, img_height, font_size=None,
+                          outline=12, color=(255, 255, 255)):
+    """Anime-style subtitle: one line, white text, thick black outline.
+
+    No per-word highlighting — just a clean single line that fades in and
+    out between chunks. Simpler and smoother than karaoke for fast speech.
+    """
+    img = Image.new("RGBA", (img_width, img_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    if font_size is None:
+        font_size = int(img_height * 0.55)
+
+    font = get_font(font_size)
+
+    # Auto-shrink if the line is too wide
+    while font_size > 24:
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] < img_width - 30:
+            break
+        font_size -= 4
+        font = get_font(font_size)
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    start_x = (img_width - text_w) // 2
+    ty = (img_height - text_h) // 2
+
+    # Thick black outline
+    for dx in range(-outline, outline + 1):
+        for dy in range(-outline, outline + 1):
+            if dx * dx + dy * dy <= outline * outline:
+                draw.text((start_x + dx, ty + dy), text, font=font,
+                          fill=(0, 0, 0, 255))
+
+    # White fill
+    draw.text((start_x, ty), text, font=font, fill=color)
+    return np.array(img)
+
+
 # ─── Clip Creation ────────────────────────────────────────────────────────────
 def create_vertical_clip_with_captions(video_path, clip_info, transcript, output_filename,
                                         chunk_size=4, outline=12, speaker_track=True,
-                                        logo_path=None):
+                                        logo_path=None, caption_style="karaoke"):
     """
-    Create a vertical (9:16) clip with karaoke-style captions.
-    Each caption line shows a chunk of words; the currently-spoken word
-    is highlighted in yellow (Hormozi style), others in white.
+    Create a vertical (9:16) clip with captions.
+
+    Two caption styles:
+      "karaoke"  — full line white, currently-spoken word pops yellow
+                    (Hormozi style). Each word's clip now overlaps the
+                    next word, so there are no frame gaps and no lag.
+      "subtitle" — one line at a time, fades in/out between chunks
+                    (anime-style). Simpler, smoother for fast speech.
 
     If speaker_track=True, the video is dynamically cropped to keep the
     speaker centered (face tracking) instead of a static center crop.
@@ -964,9 +1010,10 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
         transcript: Whisper transcript result
         output_filename: Output filename
         chunk_size: Number of words per caption line (4-6 recommended)
-        outline: Black outline thickness (8-15 recommended)
+        outline: Black outline thickness (6-20 recommended)
         speaker_track: Whether to track the speaker's face (default True)
         logo_path: Path to a PNG/JPG logo overlay (optional)
+        caption_style: "karaoke" or "subtitle" (default "karaoke")
 
     Returns:
         dict with 'path', 'title', 'hashtags' keys
@@ -1035,32 +1082,62 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
     font_size = int(h * 0.10)
     txt_clips = [video]
 
-    # Split words into chunks (caption lines)
-    for chunk_idx in range(0, len(word_list), chunk_size):
-        chunk = word_list[chunk_idx:chunk_idx + chunk_size]
-        chunk_text = " ".join(w['word'] for w in chunk)
-        chunk_start = chunk[0]['start']
-        chunk_end = chunk[-1]['end']
+    # Two caption styles:
+    #   "karaoke"   — full line white, current word pops yellow (Hormozi)
+    #   "subtitle"  — one line at a time, fades in/out, anime-style
+    if caption_style == "subtitle":
+        # Group words into chunks, one visible line per chunk. Each chunk
+        # is a single ImageClip with a fade-in/fade-out so there are no
+        # hard cuts between words and no lag between frames.
+        for chunk_idx in range(0, len(word_list), chunk_size):
+            chunk = word_list[chunk_idx:chunk_idx + chunk_size]
+            chunk_text = " ".join(w['word'] for w in chunk)
+            chunk_start = chunk[0]['start']
+            chunk_end = chunk[-1]['end']
+            duration = max(0.3, chunk_end - chunk_start)
 
-        # For each word in this chunk, create a sub-clip highlighting it
-        for word_pos, w in enumerate(chunk):
-            word_start = w['start']
-            word_end = w['end']
-            duration = max(0.2, word_end - word_start)
-
-            img_np = create_karaoke_image(
+            img_np = create_subtitle_image(
                 chunk_text,
-                w['word'],
-                word_pos,
                 img_width=int(video.w),
                 img_height=caption_height,
                 font_size=font_size,
                 outline=outline,
             )
             txt_clip = mp.ImageClip(img_np, transparent=True)
-            txt_clip = txt_clip.set_start(word_start).set_duration(duration)
+            # Fade in/out so transitions are smooth, not hard cuts.
+            txt_clip = txt_clip.set_start(chunk_start).set_duration(duration)
+            txt_clip = txt_clip.crossfadein(0.12).crossfadeout(0.12)
             txt_clip = txt_clip.set_position(('center', caption_y))
             txt_clips.append(txt_clip)
+    else:
+        # Karaoke: one ImageClip per word, but each clip is long enough to
+        # overlap the next word. Previously each word's clip ended exactly
+        # at its end time, leaving a gap where no frame was rendered —
+        # that gap is what caused the lag and the "said/done" bleed.
+        for chunk_idx in range(0, len(word_list), chunk_size):
+            chunk = word_list[chunk_idx:chunk_idx + chunk_size]
+            chunk_text = " ".join(w['word'] for w in chunk)
+
+            for word_pos, w in enumerate(chunk):
+                word_start = w['start']
+                word_end = w['end']
+                # Hold each word for at least 0.15s and let it overlap the
+                # next word by 0.12s so no frame gap ever occurs.
+                duration = max(0.15, (word_end - word_start) + 0.12)
+
+                img_np = create_karaoke_image(
+                    chunk_text,
+                    w['word'],
+                    word_pos,
+                    img_width=int(video.w),
+                    img_height=caption_height,
+                    font_size=font_size,
+                    outline=outline,
+                )
+                txt_clip = mp.ImageClip(img_np, transparent=True)
+                txt_clip = txt_clip.set_start(word_start).set_duration(duration)
+                txt_clip = txt_clip.set_position(('center', caption_y))
+                txt_clips.append(txt_clip)
 
     final = mp.CompositeVideoClip(txt_clips)
 
