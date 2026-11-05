@@ -899,7 +899,7 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     clusters = []  # list of [x_center_sum, count, size_sum] in det px
     for i in seed_frames:
         faces = detect_at(i)
-        if faces is None:
+        if not faces:
             continue
         for f in faces:
             cx = (f[0] + f[2] / 2.0) * scale
@@ -921,17 +921,31 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
         faces = detect_at(i)
 
         chosen = None
-        if faces is not None and len(faces):
-            # Score each face: prefer proximity to the current track, then size.
+        if faces:
+            # Pick the candidate that is closest to the current track.
+            # NOTE: there is no hard distance cutoff here. The old code
+            # rejected any candidate farther than max_jump_frac of the frame
+            # width — but a speaker moving from one side of the frame to the
+            # other is *more* than 22% of the width, so it got rejected every
+            # frame and the crop just held the old position. That is exactly
+            # the "it crawls to the speaker / stops recentering" behaviour.
+            #
+            # What stops a stray object (a tombstone, a pet) from hijacking
+            # the crop is the hold-gate below, not a distance cutoff: a
+            # flickering detection does not survive N consecutive frames.
+            # Only a *persistent* candidate can take over, and a persistent
+            # object on the other side of the frame is rare enough that the
+            # occasional wrong lock is acceptable — it is far better than
+            # never following a real speaker switch.
             def score(f):
                 cx = (f[0] + f[2] / 2.0) * scale
-                dist = abs(cx - last_x)
-                return (dist, -(f[2] * f[3]))
+                return abs(cx - last_x)
 
-            faces_sorted = sorted(faces, key=score)
-            cand = faces_sorted[0]
+            cand = min(faces, key=score)
             cand_x = (cand[0] + cand[2] / 2.0) * scale
-            if abs(cand_x - last_x) <= max_jump:
+            # Absolute safety valve: never snap to something outside the
+            # frame (a detection glitch can report a huge box).
+            if 0 <= cand_x <= w:
                 chosen = cand_x
 
         if chosen is not None:
@@ -941,10 +955,26 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
             # candidate is from the current track, the faster we accept it —
             # a big persistent jump means a speaker switch, and those need
             # to snap to the new face immediately instead of crawling.
-            if pending_x is not None and abs(chosen - pending_x) <= 0.5 * max_jump:
+            #
+            # The counter compares against the position where the candidate
+            # FIRST appeared, not the previous frame's candidate. Comparing
+            # against the previous frame's candidate resets the counter
+            # whenever the new speaker is still walking across the frame —
+            # their detected position moves every frame, so the counter
+            # could never reach the threshold and the crop would crawl
+            # forever behind a moving speaker.
+            if pending_x is None:
+                pending_x = chosen
+                pending_first = chosen
+                pending_count = 1
+            elif abs(chosen - pending_first) <= 0.5 * max_jump:
                 pending_count += 1
             else:
+                # Candidate jumped again — restart the hold window at the
+                # new position. (A real speaker's face drifts slowly, so
+                # this only restarts for genuine new detections.)
                 pending_x = chosen
+                pending_first = chosen
                 pending_count = 1
             dist = abs(pending_x - last_x)
             if dist > 0.5 * max_jump:

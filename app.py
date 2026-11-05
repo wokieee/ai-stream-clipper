@@ -176,6 +176,9 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
         st.warning("Please choose a video file first.")
         st.stop()
 
+    # Clear any previous run so a re-run doesn't stack clips on top of old ones.
+    st.session_state.pop("results", None)
+
     with st.status("Processing video pipeline...", expanded=True) as status:
 
         # Step 1: Get the video — download from URL, or use the local file
@@ -220,9 +223,39 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
 
         status.update(label="✅ Processing complete!", state="complete", expanded=False)
 
-    st.success(f"Generated {len(rendered_clips)} clips! 🎉")
+    # Persist to session_state so moving a slider, switching tabs, or any
+    # other interaction doesn't wipe the clips. Streamlit re-runs the whole
+    # script on every interaction, and a plain local variable would be gone.
+    st.session_state["results"] = {
+        "clips": rendered_clips,
+        "viral_clips": viral_clips,
+    }
 
-    # ─── Results Display — Card-style grid ────────────────────────────────────
+    # Cleanup: remove the downloaded source video and the temp upload
+    # folder (but NOT the user's own file when they picked a local path)
+    try:
+        if source_mode == "Paste URL" and os.path.exists(video_file):
+            os.remove(video_file)
+            st.caption("🗑️  Downloaded source video cleaned up")
+        elif source_mode == "Choose local file" and uploaded_video_path is not None:
+            if os.path.exists(uploaded_video_path):
+                os.remove(uploaded_video_path)
+                st.caption("🗑️  Uploaded video cleaned up")
+            # Remove the temp folder if it is now empty
+            up_dir = os.path.dirname(uploaded_video_path)
+            if up_dir and os.path.isdir(up_dir) and not os.listdir(up_dir):
+                os.rmdir(up_dir)
+    except Exception:
+        pass
+
+# ─── Results Display — Card-style grid ────────────────────────────────────
+# Rendered from st.session_state so it survives slider moves and tab
+# switches. Only the download buttons are per-run (they're cheap).
+results = st.session_state.get("results")
+if results:
+    rendered_clips = results["clips"]
+    viral_clips = results["viral_clips"]
+    st.success(f"Generated {len(rendered_clips)} clips! 🎉")
     for i, meta in enumerate(rendered_clips):
         path = meta['path']
         clip_info = viral_clips[i]
@@ -250,21 +283,4 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
             st.markdown(f'**Score:** {clip_info["score"]:.2f}')
             st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Cleanup: remove the downloaded source video and the temp upload
-    # folder (but NOT the user's own file when they picked a local path)
-    try:
-        if source_mode == "Paste URL" and os.path.exists(video_file):
-            os.remove(video_file)
-            st.caption("🗑️  Downloaded source video cleaned up")
-        elif source_mode == "Choose local file" and uploaded_video_path is not None:
-            if os.path.exists(uploaded_video_path):
-                os.remove(uploaded_video_path)
-                st.caption("🗑️  Uploaded video cleaned up")
-            # Remove the temp folder if it is now empty
-            up_dir = os.path.dirname(uploaded_video_path)
-            if up_dir and os.path.isdir(up_dir) and not os.listdir(up_dir):
-                os.rmdir(up_dir)
-    except Exception:
-        pass
+        st.markdown('</div>')
