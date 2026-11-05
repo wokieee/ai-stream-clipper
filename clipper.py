@@ -974,29 +974,36 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
 
         chosen = None
         if faces:
-            # Pick the candidate to follow. The primary key is FACE SIZE,
-            # not proximity to the last position — the old code sorted by
-            # distance first, which made it chase whichever face happened to
-            # be nearest the previous frame. In a two-person conversation
-            # that meant the crop lurched back and forth between the two
-            # speakers every frame (measured: 90 jumps over 100px in one
-            # 4-minute clip, max 500px). The speaker is usually the face
-            # closest to the camera, i.e. the biggest one.
-            #
-            # Distance is only a tiebreak among faces of similar size, so a
-            # genuine speaker switch still follows the new person instead
-            # of locking onto a giant background object.
-            def score(f):
-                area = f[2] * f[3]
-                cx = (f[0] + f[2] / 2.0) * scale
-                return (-area, abs(cx - last_x))
+            # When TWO people are on screen (a conversation), the honest
+            # answer is "center on both of them" — picking the biggest face
+            # made the crop lurch back and forth between the two speakers
+            # on every cut, which is exactly the ugly chasing the user saw.
+            # Averaging their positions keeps both in frame and the crop
+            # still. Only when one face is clearly dominant (a solo speaker)
+            # do we follow that single face.
+            areas = [f[2] * f[3] for f in faces]
+            total = sum(areas)
+            biggest = max(areas)
+            if len(faces) >= 2 and biggest < 1.6 * (total - biggest):
+                # Two comparable faces — center on the pair
+                cxs = [(f[0] + f[2] / 2.0) * scale for f in faces]
+                chosen = sum(cxs) / len(cxs)
+            else:
+                # Solo speaker, or one face dominates — follow it.
+                # FACE SIZE is the primary key, not proximity to the last
+                # position: the old distance-first sort made the crop chase
+                # whichever face happened to be nearest the previous frame.
+                def score(f):
+                    area = f[2] * f[3]
+                    cx = (f[0] + f[2] / 2.0) * scale
+                    return (-area, abs(cx - last_x))
 
-            cand = min(faces, key=score)
-            cand_x = (cand[0] + cand[2] / 2.0) * scale
-            # Absolute safety valve: never snap to something outside the
-            # frame (a detection glitch can report a huge box).
-            if 0 <= cand_x <= w:
-                chosen = cand_x
+                cand = min(faces, key=score)
+                cand_x = (cand[0] + cand[2] / 2.0) * scale
+                # Absolute safety valve: never snap to something outside the
+                # frame (a detection glitch can report a huge box).
+                if 0 <= cand_x <= w:
+                    chosen = cand_x
 
         if chosen is not None:
             # Adaptive hold: a candidate that persists for several frames
@@ -1376,7 +1383,16 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
             chunk_text = " ".join(w['word'] for w in chunk)
             chunk_start = chunk[0]['start']
             chunk_end = chunk[-1]['end']
-            duration = max(0.3, chunk_end - chunk_start)
+            # End BEFORE the next chunk starts. The old code set
+            # duration = max(0.3, chunk_end - chunk_start), so a short chunk
+            # (fast speaker, few words) stretched to swallow the next chunk's
+            # start time — the two subtitle images overlapped and merged
+            # into one jumble. Each line now owns its own time window.
+            next_start = (word_list[chunk_idx + chunk_size]['start']
+                          if chunk_idx + chunk_size < len(word_list)
+                          else clip_duration)
+            duration = min(chunk_end - chunk_start, next_start - chunk_start)
+            duration = max(0.15, duration)
 
             img_np = create_subtitle_image(
                 chunk_text,
@@ -1406,6 +1422,12 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
                 # Hold each word for at least 0.15s and let it overlap the
                 # next word by 0.12s so no frame gap ever occurs.
                 duration = max(0.15, (word_end - word_start) + 0.12)
+                # But never let a word's clip run past the START of the next
+                # word — otherwise two different captions overlap and merge
+                # into a jumble (the "captions still merge" symptom).
+                if word_pos + 1 < len(chunk):
+                    next_word_start = chunk[word_pos + 1]['start']
+                    duration = min(duration, next_word_start - word_start + 0.12)
 
                 img_np = create_karaoke_image(
                     chunk_text,

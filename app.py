@@ -260,10 +260,13 @@ if results:
         path = meta['path']
         clip_info = viral_clips[i]
         st.markdown(f'<div class="clip-card">', unsafe_allow_html=True)
-        col_video, col_meta = st.columns([3, 1])
+        col_video, col_meta = st.columns([2, 1])
 
         with col_video:
-            st.video(path, width=240)
+            # Full-width preview inside the card — the old 240px-wide
+            # thumbnail in a narrow column looked tiny and left the card
+            # half empty.
+            st.video(path)
             with open(path, "rb") as f:
                 st.download_button(
                     label=f"⬇️  Download Clip {i+1}",
@@ -283,4 +286,7 @@ if results:
             st.markdown(f'**Score:** {clip_info["score"]:.2f}')
             st.markdown('</div>', unsafe_allow_html=True)
 
+        # Card close tag goes LAST, after both columns have rendered —
+        # putting it inside a column left an unbalanced </div> at the
+        # bottom of the page.
         st.markdown('</div>')
