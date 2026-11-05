@@ -954,30 +954,31 @@ def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
         filtered.append((t, tgt, cut))
 
     # ── Pass 2: the edit ─────────────────────────────────────────────────
-    # State machine over the scan. Exactly one segment is "open" at a time:
-    # a HOLD at center `cur`, or a PAN from `pan_from` toward `cur` that
-    # finishes at `pan_end`. Segments close ONLY at events (scene cut, pan
-    # completion, pan start, clip end), and each close emits its piece as
-    # [seg_start, t_event] — so pieces tile the timeline exactly: no
-    # overlaps, no gaps, by construction. (The first attempt tracked pan
-    # end-times separately and produced overlapping pieces when a cut
-    # arrived mid-pan; this version cannot.)
+    # Decisive camera path: HOLD, SNAP at scene cuts, and one eased PAN per
+    # deliberate reframe. Pans have a FIXED duration (pan_time) decided the
+    # instant the reframe is triggered, and they are emitted immediately —
+    # so detection gaps can never stretch them.
+    #
+    # That stretching was the lag. The previous version closed a pan only
+    # when the next valid face detection arrived, but YuNet misses ~half
+    # the frames, so a long stretch of None detections kept the pan open
+    # and a 0.5s smoothstep got stretched to 3.4s — a crawl, not a pan.
+    # Pans are now emitted at decision time and pieces tile the timeline
+    # exactly: no overlaps, no gaps, by construction.
     pieces = []
-    cur = None            # center the crop holds, or is panning toward
-    seg_start = 0.0       # when the open segment began
-    seg_is_pan = False
-    pan_from = 0.0
-    pan_end = 0.0
+    cur = None            # center the crop holds, or is gliding toward
+    seg_start = 0.0       # when the current HOLD began
+    pan_start = None      # when the current PAN began (None = not panning)
+    pan_end = 0.0         # when the current PAN finishes
+    pan_from = 0.0        # where the current PAN started from
     drift = []            # (t, target) since the last commit
     drift_since = None    # when the median first left the deadband
 
-    def close(t_end):
-        nonlocal seg_start, seg_is_pan
+    def close_hold(t_end):
+        nonlocal seg_start
         if cur is not None and t_end > seg_start:
-            x0 = pan_from if seg_is_pan else cur
-            pieces.append((seg_start, t_end, x0, cur))
+            pieces.append((seg_start, t_end, cur, cur))
         seg_start = t_end
-        seg_is_pan = False
 
     for t, tgt, cut in filtered:
         if tgt is None:
@@ -989,18 +990,23 @@ def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
             seg_start = 0.0
             continue
         if cut:
-            # Scene cut: close the open segment at the cut and SNAP to the
-            # new speaker. The picture itself changes at this instant, so
-            # the cut hides the reframe — a pan in flight is simply cut
-            # short, the viewer never sees it finish.
-            close(t)
+            # Scene cut: truncate any pan in flight, then SNAP to the new
+            # speaker. The picture itself changes at this instant, so the
+            # cut hides the reframe — no crawl.
+            if pan_start is not None:
+                pieces.append((pan_start, t, pan_from, cur))
+                pan_start = None
+                seg_start = t
+            else:
+                close_hold(t)
             cur = tgt
             drift, drift_since = [], None
             continue
-        if seg_is_pan:
+        if pan_start is not None:
             if t < pan_end:
-                continue            # wait out the pan; never steer mid-move
-            close(t)                # pan lands here; hold continues at cur
+                continue            # glide in flight; never steer mid-move
+            pan_start = None        # pan landed; hold resumes at cur
+            seg_start = pan_end
             drift, drift_since = [], None
             # fall through — this sample still feeds drift
         drift.append((t, tgt))
@@ -1011,17 +1017,23 @@ def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
                 if drift_since is None:
                     drift_since = t
                 if t - drift_since >= drift_min:
-                    # Deliberate reframe: ONE eased pan, then hold again.
-                    close(t)
-                    seg_is_pan = True
-                    pan_from = cur
+                    # Deliberate reframe: close the hold, emit ONE
+                    # fixed-duration pan, then hold again at the new
+                    # center. Emitted NOW so gaps cannot stretch it.
+                    close_hold(t)
+                    pieces.append((t, t + pan_time, cur, med))
+                    pan_start = t
                     pan_end = t + pan_time
+                    pan_from = cur
                     cur = med
                     drift, drift_since = [], None
             else:
                 drift_since = None
 
-    close(duration)
+    if pan_start is not None:
+        pieces.append((pan_start, duration, pan_from, cur))
+    else:
+        close_hold(duration)
     if not pieces:
         return lambda t: w / 2.0
     # Clamp every center so the crop window stays inside the frame.
