@@ -59,7 +59,7 @@ with st.sidebar:
     )
     chunk_size = st.slider("Words per line", 3, 8, 5, 1)
     outline = st.slider("Outline thickness", 2, 20, 6, 1)
-caption_size = st.slider("Caption font size", 40, 120, 72, 2)
+    caption_size = st.slider("Caption font size", 40, 120, 72, 2)
 
     st.subheader("Framing")
     speaker_track = st.toggle(
