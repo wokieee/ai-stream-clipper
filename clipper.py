@@ -192,6 +192,9 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
     total_duration = current_end - current_start
 
     # Slide through segments, collecting clips within duration bounds
+    # Boundary-awareness: a clip that starts mid-joke and ends mid-sentence
+    # is just random. A good clip starts on a real thought boundary and
+    # ends on a natural break. Score that explicitly.
     for i, seg in enumerate(segments):
         # Try to form a clip starting at this segment
         for j in range(i + 1, len(segments) + 1):
@@ -205,7 +208,8 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
                 break
 
             clip_text = " ".join(s['text'] for s in segments[i:j])
-            word_count = len(clip_text.split())
+            clip_words = clip_text.split()
+            word_count = len(clip_words)
 
             # Score: words per second should be 2-8 (roughly conversational)
             wps = word_count / max(duration, 0.1)
@@ -214,12 +218,55 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             else:
                 density_score = 0.3
 
+            # ── Boundary scoring (the part that was missing) ──────────────
+            # A clip that starts mid-sentence ("...and then the dog ran")
+            # or ends mid-sentence ("I was gonna tell you—") feels
+            # random. Reward clips that begin and end on thought breaks.
+
+            # START boundary: does the clip begin a new thought?
+            # - The first word is capitalized (proper start of a sentence)
+            # - The previous segment ended with sentence-ending punctuation
+            # - The first word is not a continuation word (but, and, so, the)
+            start_words = clip_words[:4]
+            first_word = start_words[0] if start_words else ""
+            starts_new_thought = False
+            if i == 0:
+                starts_new_thought = True  # nothing before it
+            else:
+                prev_text = segments[i - 1]['text'].strip()
+                prev_ends_sentence = bool(re.search(r'[.!?"]\s*$', prev_text))
+                continuation_words = {'but', 'and', 'so', 'the', 'that', 'which',
+                                      'because', 'although', 'while', 'if', 'when'}
+                if prev_ends_sentence or first_word.lower() not in continuation_words:
+                    starts_new_thought = True
+            start_bonus = 0.45 if starts_new_thought else 0.0
+
+            # END boundary: does the clip end on a natural break?
+            # - Last segment ends with sentence-ending punctuation
+            # - Or the next segment starts a new sentence (so the clip
+            #   didn't cut off mid-thought)
+            last_text = segments[j - 1]['text'].strip()
+            ends_clean = bool(re.search(r'[.!?"]\s*$', last_text))
+            if not ends_clean and j < len(segments):
+                next_text = segments[j]['text'].strip()
+                next_starts_new = bool(re.match(r'^[A-Z]', next_text))
+                if next_starts_new:
+                    ends_clean = True
+            end_bonus = 0.45 if ends_clean else 0.0
+
+            # Hook: is there a topic word in the first few words? A clip
+            # that opens on a real subject ("the dog", "the market", "that
+            # guy") hooks the viewer; one that opens on filler doesn't.
+            hook_words = [w.lower().strip(".,;:!?") for w in clip_words[:5]]
+            has_hook = any(w in _TOPIC_WORDS for w in hook_words)
+            hook_bonus = 0.25 if has_hook else 0.0
+
             # Prefer clips that don't start/end with filler words
             filler_start = any(t in ('um', 'uh', 'ah', 'like', 'you know', 'so')
                                for t in clip_text.strip().lower().split()[:3])
             filler_end = any(t in ('um', 'uh', 'ah', 'okay', 'yeah')
                              for t in clip_text.strip().lower().split()[-2:])
-            filler_penalty = 0.15 if (filler_start or filler_end) else 0.0
+            filler_penalty = 0.35 if (filler_start or filler_end) else 0.0
 
             # Duration bonus: shorter clips (15-30s) tend to perform better
             if 15 <= duration <= 30:
@@ -229,7 +276,8 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             else:
                 duration_bonus = 0.0
 
-            score = max(0, density_score + duration_bonus - filler_penalty)
+            score = max(0, density_score + start_bonus + end_bonus
+                        + hook_bonus + duration_bonus - filler_penalty)
 
             candidates.append({
                 'start': clip_start,
