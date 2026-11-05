@@ -5,3 +5,5 @@ moviepy
 torch
 torchaudio
 opencv-python
+pillow
+streamlit

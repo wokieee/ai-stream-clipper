@@ -21,5 +21,8 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Temp uploads from the drag-drop box (cleaned up after each run)
+tmp_uploads/
+
 # Auth — session cookies for yt-dlp (never commit!)
 cookies.txt
