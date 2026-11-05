@@ -39,14 +39,18 @@ comes with a suggested title and hashtags.
 ## ⚠️ YouTube downloads need cookies
 
 Some YouTube videos trigger a bot-check ("Sign in to confirm you're not a
-bot"). To fix this:
+bot"). The app **cannot** pull cookies automatically — Chrome locks its
+cookie file while it is running, and yt-dlp cannot decrypt the cookies
+when Chrome is closed. You need to export them once, manually:
 
 1. Install the **"Get cookies.txt LOCALLY"** Chrome extension.
-2. Open it while logged into YouTube in Chrome.
-3. Click **"Export"** → save the file as `cookies.txt` in the
-   `C:\AI-Stream-Clipper` folder.
+2. Open `youtube.com` in Chrome while logged in.
+3. Click the extension, then **"Export"**.
+4. Save the file as `C:\AI-Stream-Clipper\cookies.txt`.
 
-The app checks `cookies.txt` first, then falls back to browser extraction.
+After that, every YouTube download works with no further setup. If a
+download still fails, the app shows the exact steps above instead of a
+raw error.
 
 ## Troubleshooting
 

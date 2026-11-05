@@ -53,6 +53,26 @@ def get_font(size):
     return ImageFont.load_default()
 
 
+# ─── Cookie handling ──────────────────────────────────────────────────────────
+def _cookies_args():
+    """Build the --cookies argument list for yt-dlp.
+
+    Order of preference:
+      1. A manually-exported cookies.txt (most reliable — works even if
+         Chrome is closed, because it is a plain copy in Netscape format).
+      2. Chrome's live cookie DB via --cookies-from-browser. This needs
+         Chrome CLOSED: yt-dlp copies the DB file, and Chrome locks it
+         while running (yt-dlp issue #7271).
+    """
+    cookies_file = os.path.join(CLIPPER_DIR, "cookies.txt")
+    if os.path.exists(cookies_file):
+        return ["--cookies", cookies_file]
+    chrome_data = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
+    if os.path.isdir(chrome_data):
+        return ["--cookies-from-browser", "chrome"]
+    return []
+
+
 # ─── Video Download ───────────────────────────────────────────────────────────
 def download_video(url, run_id=None, min_height=1080):
     """
@@ -76,27 +96,7 @@ def download_video(url, run_id=None, min_height=1080):
     # #7271), so we also support a manually-exported cookies.txt as backup.
     cookies_arg = []
     cookies_file = os.path.join(CLIPPER_DIR, "cookies.txt")
-    if os.path.exists(cookies_file):
-        cookies_arg = ["--cookies", cookies_file]
-    else:
-        chrome_data = os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\User Data")
-        if os.path.isdir(chrome_data):
-            profile = "chrome"  # default profile
-            try:
-                import json as _json
-                local_state = os.path.join(chrome_data, "Local State")
-                if os.path.exists(local_state):
-                    with open(local_state, encoding="utf-8") as fh:
-                        info = _json.load(fh).get("profile", {}).get("info_cache", {})
-                    # Prefer the most-recently-active profile that has a Cookies file
-                    for name in sorted(info, key=lambda n: info[n].get("active_time", 0), reverse=True):
-                        cookie_db = os.path.join(chrome_data, name, "Network", "Cookies")
-                        if os.path.exists(cookie_db):
-                            profile = "chrome" if name == "Default" else f"chrome:{name}"
-                            break
-            except Exception:
-                pass
-            cookies_arg = ["--cookies-from-browser", profile]
+    cookies_arg = _cookies_args()
 
     # Format spec: prefer 1080p+ mp4, fall back to best available
     fmt = (
@@ -147,9 +147,17 @@ def download_video(url, run_id=None, min_height=1080):
     # hint instead of a raw traceback.
     if "Sign in to confirm" in last_stderr or "not a bot" in last_stderr:
         raise RuntimeError(
-            "YouTube bot-check blocked this video even with cookies. "
-            "Fix: open youtube.com in Chrome while logged in, export cookies "
-            "with the cookie extension, and save as C:\\AI-Stream-Clipper\\cookies.txt"
+            "YouTube blocked this download with its bot-check "
+            "('Sign in to confirm you are not a bot').\n\n"
+            "The app could not pull cookies automatically because Chrome "
+            "locks its cookie file while it is running, and yt-dlp cannot "
+            "decrypt them when Chrome is closed.\n\n"
+            "Fix (one-time, ~30 seconds):\n"
+            "  1. Install the 'Get cookies.txt LOCALLY' Chrome extension.\n"
+            "  2. Open youtube.com in Chrome while logged in.\n"
+            "  3. Click the extension, then 'Export'.\n"
+            "  4. Save the file as C:\\AI-Stream-Clipper\\cookies.txt\n\n"
+            "After that, every YouTube download works without any further setup."
         ) from last_err
     raise last_err
 
