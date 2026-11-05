@@ -863,10 +863,6 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     w, h = video.size
     duration = video.duration
     fps = video.fps or 24
-    # 640px input, NOT 320: a facecam face is only ~150px in a 1080p frame,
-    # and shrinking to 320 width makes it ~25px — below YuNet's reliable size.
-    # At 320 we missed ~60% of frames (tracker "held" through long dead zones);
-    # at 640 detection recall on real stream footage was ~100%.
     det_w = 640
     det_h = max(1, int(h * float(det_w) / w))
     scale = w / det_w  # source px per small-frame px
@@ -875,20 +871,31 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     times, xs = [], []
     last_x = w / 2.0
     pending_x = None        # candidate waiting for hold_frames confirmation
+    pending_first = None    # where that candidate first appeared
     pending_count = 0
+    last_hist = None        # HSV histogram of the previous detection frame
     n_frames = int(duration * fps)
 
     def detect_at(i):
         t = min(i / fps, max(0.0, duration - 0.01))
         frame = video.get_frame(t)
         small = cv2.resize(frame, (det_w, det_h))
+        # Histogram for scene-cut detection: two frames of the same shot
+        # correlate >0.85; a camera cut or hard scene change drops sharply.
+        hist = cv2.calcHist([small], [0, 1], None, [16, 16],
+                            [0, 256, 0, 256])
+        cv2.normalize(hist, hist)
         detector.setInputSize((det_w, det_h))
         rc, faces = detector.detect(small)
-        # YuNet returns (rc, faces) where faces is None when nothing is
-        # detected. Callers must guard for None — len(None) raises TypeError,
+        # YuNet returns (rc, faces). faces is an (N,15) array, or None when
+        # nothing is detected. Guard for both — len(None) raises TypeError,
         # and that exception used to kill the WHOLE track and fall back to a
         # static center crop (i.e. "it stopped recentering entirely").
-        return faces if (rc == 1 and faces is not None) else []
+        # Return a plain list so callers can use `if not faces:` without
+        # numpy ambiguity errors.
+        if faces is None or len(faces) == 0:
+            return [], hist
+        return [tuple(f) for f in faces], hist
 
     # ── Seed: find the most *persistent* face in the opening seconds ─────────
     # Stream facecams sit anywhere in frame (often a corner), so starting from
@@ -898,7 +905,7 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     seed_frames = list(range(0, min(n_frames, sample_step * 24), sample_step))
     clusters = []  # list of [x_center_sum, count, size_sum] in det px
     for i in seed_frames:
-        faces = detect_at(i)
+        faces, _ = detect_at(i)
         if not faces:
             continue
         for f in faces:
@@ -916,30 +923,62 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
         best_c = max(clusters, key=lambda c: (c[1], c[2]))
         last_x = best_c[0] / best_c[1]
 
+    # Sample the (slow) YuNet detector at 1fps, not the video's 25fps. At
+    # 25fps each detection takes ~400ms, so by the time the result comes
+    # back the speaker has moved on and the track lags. 1fps still reacts
+    # to a speaker switch within a second. (sample_step is the *display*
+    # cadence of the track; this is the detection cadence.)
+    det_step = 1.0  # seconds between detections
+
     for i in range(0, n_frames, sample_step):
         t = min(i / fps, max(0.0, duration - 0.01))
-        faces = detect_at(i)
+        # Only run the (slow) detector at det_step cadence; reuse the last
+        # result in between. Detecting every frame was both slow and
+        # pointless — YuNet misses ~half the frames on real stream footage,
+        # so a per-frame detector just produced gaps.
+        if i % max(1, int(round(det_step * fps))) == 0:
+            faces, hist = detect_at(i)
+            last_faces = faces
+            # Scene-cut detection. This is the key fix for interview / talk
+            # footage: the camera cuts between two speakers every few
+            # seconds, and a cut is a genuine scene change — the new frame
+            # is NOT a continuation of the old one, so the hold gate (which
+            # exists to reject detection flicker within a shot) should not
+            # apply. Two frames of the same shot correlate >0.85; a cut
+            # drops well below that, and we snap to the new face instantly.
+            #
+            # Without this the tracker held the old position through every
+            # cut (the hold counter never reached the threshold, because
+            # each cut's new face is far from the previous one), which is
+            # exactly the "crawls to the speaker / stops recentering" the
+            # user saw.
+            if last_hist is not None and hist is not None:
+                corr = cv2.compareHist(last_hist, hist, cv2.HISTCMP_CORREL)
+                if corr < 0.85:
+                    pending_x = None
+                    pending_count = 0
+            last_hist = hist
+        else:
+            faces = last_faces
 
         chosen = None
         if faces:
-            # Pick the candidate that is closest to the current track.
-            # NOTE: there is no hard distance cutoff here. The old code
-            # rejected any candidate farther than max_jump_frac of the frame
-            # width — but a speaker moving from one side of the frame to the
-            # other is *more* than 22% of the width, so it got rejected every
-            # frame and the crop just held the old position. That is exactly
-            # the "it crawls to the speaker / stops recentering" behaviour.
+            # Pick the candidate to follow. The primary key is FACE SIZE,
+            # not proximity to the last position — the old code sorted by
+            # distance first, which made it chase whichever face happened to
+            # be nearest the previous frame. In a two-person conversation
+            # that meant the crop lurched back and forth between the two
+            # speakers every frame (measured: 90 jumps over 100px in one
+            # 4-minute clip, max 500px). The speaker is usually the face
+            # closest to the camera, i.e. the biggest one.
             #
-            # What stops a stray object (a tombstone, a pet) from hijacking
-            # the crop is the hold-gate below, not a distance cutoff: a
-            # flickering detection does not survive N consecutive frames.
-            # Only a *persistent* candidate can take over, and a persistent
-            # object on the other side of the frame is rare enough that the
-            # occasional wrong lock is acceptable — it is far better than
-            # never following a real speaker switch.
+            # Distance is only a tiebreak among faces of similar size, so a
+            # genuine speaker switch still follows the new person instead
+            # of locking onto a giant background object.
             def score(f):
+                area = f[2] * f[3]
                 cx = (f[0] + f[2] / 2.0) * scale
-                return abs(cx - last_x)
+                return (-area, abs(cx - last_x))
 
             cand = min(faces, key=score)
             cand_x = (cand[0] + cand[2] / 2.0) * scale
@@ -963,11 +1002,19 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
             # their detected position moves every frame, so the counter
             # could never reach the threshold and the crop would crawl
             # forever behind a moving speaker.
+            #
+            # Tolerance matters here: YuNet's box jitter is a few pixels,
+            # but a walking speaker's face moves much more per frame. A
+            # tight tolerance (<=0.5*max_jump) reset the counter on every
+            # frame of a real switch, so the crop never committed and just
+            # crawled. 12% of the frame width covers jitter plus a normal
+            # walking pace; a genuine new speaker on the other side of the
+            # frame still restarts the window, which is what we want.
             if pending_x is None:
                 pending_x = chosen
                 pending_first = chosen
                 pending_count = 1
-            elif abs(chosen - pending_first) <= 0.5 * max_jump:
+            elif abs(chosen - pending_first) <= 0.12 * w:
                 pending_count += 1
             else:
                 # Candidate jumped again — restart the hold window at the
@@ -977,9 +1024,9 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
                 pending_first = chosen
                 pending_count = 1
             dist = abs(pending_x - last_x)
-            if dist > 0.5 * max_jump:
+            if dist > 0.5 * w:
                 needed = 2        # speaker switch — snap fast
-            elif dist > 0.25 * max_jump:
+            elif dist > 0.25 * w:
                 needed = 3
             else:
                 needed = hold_frames
