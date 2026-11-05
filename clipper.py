@@ -874,6 +874,7 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     pending_first = None    # where that candidate first appeared
     pending_count = 0
     last_hist = None        # HSV histogram of the previous detection frame
+    last_faces = []         # most recent non-empty detection (reused in gaps)
     n_frames = int(duration * fps)
 
     def detect_at(i):
@@ -923,12 +924,15 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
         best_c = max(clusters, key=lambda c: (c[1], c[2]))
         last_x = best_c[0] / best_c[1]
 
-    # Sample the (slow) YuNet detector at 1fps, not the video's 25fps. At
-    # 25fps each detection takes ~400ms, so by the time the result comes
-    # back the speaker has moved on and the track lags. 1fps still reacts
-    # to a speaker switch within a second. (sample_step is the *display*
-    # cadence of the track; this is the detection cadence.)
-    det_step = 1.0  # seconds between detections
+    # Detection cadence. Measured on this machine: YuNet on a 640px frame
+    # takes ~14ms median, so even 25fps would be affordable. The real limit
+    # is that YuNet only detects a face on ~half the frames of real stream
+    # footage, so a per-frame detector just produces gaps. 5fps is a good
+    # balance — it reacts to a speaker switch within 0.2s, and the gaps
+    # between detections (the source of most of the "crawl") are small.
+    # (sample_step is the *display* cadence of the track; this is the
+    # detection cadence.)
+    det_step = 0.2  # seconds between detections
 
     for i in range(0, n_frames, sample_step):
         t = min(i / fps, max(0.0, duration - 0.01))
@@ -938,7 +942,14 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
         # so a per-frame detector just produced gaps.
         if i % max(1, int(round(det_step * fps))) == 0:
             faces, hist = detect_at(i)
-            last_faces = faces
+            # Keep the last NON-EMPTY detection. YuNet misses ~half the
+            # frames on real stream footage, so reusing an empty result in
+            # the gaps between detections would make the hold counter stall
+            # (no candidate to count) and the crop freeze — the "stops
+            # recentering" symptom. A stale-but-valid face is far better
+            # than no face at all for the hold gate.
+            if faces:
+                last_faces = faces
             # Scene-cut detection. This is the key fix for interview / talk
             # footage: the camera cuts between two speakers every few
             # seconds, and a cut is a genuine scene change — the new frame
@@ -1053,7 +1064,13 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     #   big move    → weak smoothing  (snap to the new speaker now)
     # This is what makes the crop follow a new speaker immediately while
     # still ignoring single-frame detection noise.
-    alpha = 0.35                      # smoothing factor for a tiny move
+    #
+    # The alpha values are tuned to the remaining jitter, which after the
+    # hold gate is mostly YuNet's box noise on a *stationary* speaker — a
+    # few pixels, not the ~100px jumps we were seeing before the fixes.
+    # A small-move alpha of 0.25 (rather than 0.35) cuts that residual jitter
+    # harder while still settling a real switch within a couple of frames.
+    alpha = 0.25                      # smoothing factor for a tiny move
     jump_alpha = 0.9                  # ~no smoothing for a big speaker switch
     xs_smooth = np.zeros_like(xs)
     xs_smooth[0] = xs[0]
