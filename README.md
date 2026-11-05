@@ -25,7 +25,8 @@ Turn long streams into viral, auto-captioned vertical shorts.
 | Max clips to generate | How many shorts to make (1–10) |
 | Caption style | **Karaoke** — word pops yellow as spoken (Hormozi style). **Subtitle** — one clean line at a time with smooth fades, like anime subs. |
 | Words per line | How many words appear per caption line |
-| Outline thickness | Thickness of the black text outline (6–20) |
+| Caption font size | Fixed text size in pixels (40–120). Captions are a fixed size now, so they don't jump between tiny and huge across clips. |
+| Outline thickness | Thickness of the black text outline (2–20) |
 | Recenter on speaker | Tracks the speaker's face and keeps them centered |
 
 **Logo overlay (optional):** open the "🏷️ Logo overlay" expander and drag in a
