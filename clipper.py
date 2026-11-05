@@ -154,20 +154,28 @@ def download_video(url, run_id=None, min_height=1080):
             # read it back instead of shelling out to ffprobe (which is
             # not on PATH on this machine).
             if "no 1080p exists" in label:
+                # yt-dlp's progress lines don't reliably contain the
+                # resolution, so ask it directly what format it would pick
+                # (no download) and read the height back.
                 try:
-                    log_text = (proc.stderr or "") + (proc.stdout or "")
-                    res_match = re.search(
-                        r"Downloading\s+\"[^\"]*\"\s+to\s+.*?(\d{3,4}[pPi])",
-                        log_text,
+                    probe = subprocess.run(
+                        ["yt-dlp", "--js-runtimes", js_runtime,
+                         "--remote-components", "ejs:github",
+                         "--skip-download", "--print", "%(height)s",
+                         url] + cookies,
+                        capture_output=True, text=True,
+                        encoding="utf-8", errors="replace",
                     )
-                    if res_match:
+                    h = (probe.stdout or "").strip()
+                    if h.isdigit():
                         print(f"  ⚠️  This video has no {min_height}p — "
-                              f"downloaded {res_match.group(1)} instead.")
+                              f"downloaded {h}px instead.")
                     else:
                         print(f"  ⚠️  This video has no {min_height}p — "
                               f"downloaded the best available format.")
                 except Exception:
-                    pass
+                    print(f"  ⚠️  This video has no {min_height}p — "
+                          f"downloaded the best available format.")
             return output_path
         except subprocess.CalledProcessError as e:
             last_err = e
