@@ -884,7 +884,11 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
         small = cv2.resize(frame, (det_w, det_h))
         detector.setInputSize((det_w, det_h))
         rc, faces = detector.detect(small)
-        return faces  # may be None
+        # YuNet returns (rc, faces) where faces is None when nothing is
+        # detected. Callers must guard for None — len(None) raises TypeError,
+        # and that exception used to kill the WHOLE track and fall back to a
+        # static center crop (i.e. "it stopped recentering entirely").
+        return faces if (rc == 1 and faces is not None) else []
 
     # ── Seed: find the most *persistent* face in the opening seconds ─────────
     # Stream facecams sit anywhere in frame (often a corner), so starting from
@@ -931,12 +935,25 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
                 chosen = cand_x
 
         if chosen is not None:
+            # Adaptive hold: a candidate that persists for several frames
+            # is almost certainly a real new speaker, not detection flicker
+            # (flicker doesn't survive N frames). So the FARTHER the
+            # candidate is from the current track, the faster we accept it —
+            # a big persistent jump means a speaker switch, and those need
+            # to snap to the new face immediately instead of crawling.
             if pending_x is not None and abs(chosen - pending_x) <= 0.5 * max_jump:
                 pending_count += 1
             else:
                 pending_x = chosen
                 pending_count = 1
-            if pending_count >= hold_frames:
+            dist = abs(pending_x - last_x)
+            if dist > 0.5 * max_jump:
+                needed = 2        # speaker switch — snap fast
+            elif dist > 0.25 * max_jump:
+                needed = 3
+            else:
+                needed = hold_frames
+            if pending_count >= needed:
                 last_x = pending_x
                 pending_x = None
                 pending_count = 0
@@ -949,16 +966,30 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
         return lambda t: w / 2.0
 
     xs = np.array(xs, dtype=float)
-    # Smooth the track
-    k = max(3, int(smooth_sec * fps / sample_step) | 1)
-    kernel = np.ones(k) / k
-    xs_smooth = np.convolve(xs, kernel, mode='same')
-
     times_a = np.array(times)
-    xs_a = xs_smooth
+
+    # Adaptive smoothing. A fixed-width moving average is the wrong tool
+    # here: it smooths out the jitter you want gone AND the speaker switch
+    # you want instant. So the smoothing strength tracks how far the last
+    # accepted position moved:
+    #   small move  → strong smoothing (kill the jitter)
+    #   big move    → weak smoothing  (snap to the new speaker now)
+    # This is what makes the crop follow a new speaker immediately while
+    # still ignoring single-frame detection noise.
+    alpha = 0.35                      # smoothing factor for a tiny move
+    jump_alpha = 0.9                  # ~no smoothing for a big speaker switch
+    xs_smooth = np.zeros_like(xs)
+    xs_smooth[0] = xs[0]
+    for i in range(1, len(xs)):
+        move = abs(xs[i] - xs[i - 1])
+        a = alpha if move <= 0.15 * w else (
+            jump_alpha if move >= 0.5 * w else
+            alpha + (jump_alpha - alpha) * ((move - 0.15 * w) / (0.35 * w))
+        )
+        xs_smooth[i] = xs_smooth[i - 1] + a * (xs[i] - xs_smooth[i - 1])
 
     def track(t):
-        return float(np.interp(t, times_a, xs_a))
+        return float(np.interp(t, times_a, xs_smooth))
 
     return track
 
