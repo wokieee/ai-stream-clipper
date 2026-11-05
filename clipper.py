@@ -164,7 +164,7 @@ def transcribe_audio(video_path):
 
 
 # ─── Viral Clip Detection ─────────────────────────────────────────────────────
-def find_viral_segments(transcript, min_duration=10, max_duration=60):
+def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=10):
     """
     Score each potential clip and return the best ones.
 
@@ -172,6 +172,11 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60):
     - Good word density (not too sparse, not a wall of text)
     - Reasonable length (10-60 seconds)
     - No dead air at start/end
+
+    Args:
+        max_clips: How many clips to return. The old hard-coded limit of 5
+                   meant the "Max clips to generate" slider was dead for
+                   values 6-10.
     """
     print("Analyzing transcript for viral clips...")
     segments = transcript.get('segments', [])
@@ -261,7 +266,7 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60):
         if not overlap:
             selected.append(c)
             used_spans.append((c['start'], c['end']))
-        if len(selected) >= 5:
+        if len(selected) >= max_clips:
             break
 
     print(f"  Found {len(selected)} candidate clips (out of {len(candidates)} analyzed)")

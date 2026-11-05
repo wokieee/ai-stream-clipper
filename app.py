@@ -195,12 +195,16 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
             transcript,
             min_duration=min_duration,
             max_duration=max_duration,
+            max_clips=max_clips,
         )
 
         # Step 4: Render clips
-        status.write(f"🎬 Rendering {min(len(viral_clips), max_clips)} clips with karaoke captions...")
+        # Only as many as were actually detected — you can't make 10 clips
+        # from 5 candidates, so this is correct behaviour, not a bug.
+        status.write(f"🎬 Rendering {len(viral_clips)} clip(s) "
+                     f"(detected {len(viral_clips)} of {max_clips} requested)")
         rendered_clips = []
-        for i, clip in enumerate(viral_clips[:max_clips]):
+        for i, clip in enumerate(viral_clips):
             out_name = f"viral_clip_{i+1:02d}.mp4"
             meta = clipper.create_vertical_clip_with_captions(
                 video_file, clip, transcript, out_name,
