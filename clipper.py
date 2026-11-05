@@ -241,6 +241,7 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
     # Boundary-awareness: a clip that starts mid-joke and ends mid-sentence
     # is just random. A good clip starts on a real thought boundary and
     # ends on a natural break. Score that explicitly.
+    best_near_miss = None  # longest clip that fits max_duration but not min
     for i, seg in enumerate(segments):
         # Try to form a clip starting at this segment
         for j in range(i + 1, len(segments) + 1):
@@ -248,10 +249,22 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             clip_end = segments[j - 1]['end']
             duration = clip_end - clip_start
 
-            if duration < min_duration:
-                continue
             if duration > max_duration:
                 break
+            if duration < min_duration:
+                # Too short to qualify, but remember the longest one that
+                # fit max_duration. If NOTHING reaches min_duration (e.g.
+                # the user set min=60/max=60 and the footage has no 60s
+                # speech block), we return this instead of the old
+                # hardcoded 30-second chunk that ignored the user's setting.
+                if best_near_miss is None or duration > best_near_miss['duration']:
+                    best_near_miss = {
+                        'start': clip_start, 'end': clip_end,
+                        'text': " ".join(s['text'] for s in segments[i:j]),
+                        'score': 0.5, 'duration': duration,
+                        'word_count': len(" ".join(s['text'] for s in segments[i:j]).split()),
+                    }
+                continue
 
             clip_text = " ".join(s['text'] for s in segments[i:j])
             clip_words = clip_text.split()
@@ -335,13 +348,24 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             })
 
     if not candidates:
-        # Fallback: just grab the first chunk
+        # Nothing met the min/max duration window. Rather than silently
+        # returning a hardcoded 30-second chunk that ignored the user's
+        # min_duration setting (which is what produced "min=60, got 30s"),
+        # return the longest clip that at least fit max_duration. If even
+        # that is missing, take the first chunk bounded by the user's own
+        # min_duration so the output at least respects the slider.
+        if best_near_miss:
+            print("  ⚠️  No clip reached the min duration — returning the "
+                  "longest available clip instead.")
+            return [best_near_miss]
+        fallback_end = min(segments[-1]['end'],
+                           segments[0]['start'] + min_duration)
         return [{
             'start': segments[0]['start'],
-            'end': min(segments[-1]['end'], segments[0]['start'] + 30),
+            'end': fallback_end,
             'text': segments[0]['text'],
             'score': 0.5,
-            'duration': 30,
+            'duration': fallback_end - segments[0]['start'],
             'word_count': len(segments[0]['text'].split()),
         }]
 
@@ -1319,30 +1343,6 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
     x1 = (w - new_w) // 2
     x2 = x1 + new_w
 
-    # ── Zoom-out helper ──────────────────────────────────────────────────
-    # A full-height 9:16 crop is the TIGHTEST possible framing — the person
-    # fills the whole frame, which read as "zoomed in too much". Zooming out
-    # properly means showing more of the scene, but a plain wider crop can't
-    # be 9:16 at the same time. The standard shorts technique: shrink the
-    # subject crop to ZOOM of frame size and composite it over a blurred,
-    # stretched copy of the same frame that fills 9:16. The person gets
-    # smaller (context around them is visible) with no distortion, and the
-    # blurred border looks intentional instead of like letterboxing.
-    ZOOM = 0.82
-
-    def zoom_out(strip):
-        fh, fw = strip.shape[:2]
-        sw, sh = int(fw * ZOOM), int(fh * ZOOM)
-        # Keep even dims — the composite is re-encoded by libx264.
-        sw -= sw % 2
-        sh -= sh % 2
-        small = cv2.resize(strip, (sw, sh), interpolation=cv2.INTER_AREA)
-        bg = cv2.resize(strip, (fw, fh), interpolation=cv2.INTER_AREA)
-        bg = cv2.GaussianBlur(bg, (0, 0), sigmaX=28)
-        ox, oy = (fw - sw) // 2, (fh - sh) // 2
-        bg[oy:oy + sh, ox:ox + sw] = small
-        return bg
-
     # ── Speaker tracking: recenter on the person talking ──────────────────────
     if speaker_track:
         print("  🎯 Detecting speaker position (face tracking)...")
@@ -1355,16 +1355,14 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
                 frame = get_frame(t)
                 x1 = int(round(max(0.0, min(max_x1, _track(t) - half))))
                 # Keep the crop width even — libx264 will reject odd widths.
-                return zoom_out(frame[:, x1:x1 + new_w])
+                return frame[:, x1:x1 + new_w]
 
             video = video.fl(crop_fn)
         except Exception as e:
             print(f"  ⚠️  Face tracking failed ({e}), using static center crop")
-            video = video.crop(x1=x1, x2=x2, y1=0, y2=h).fl(
-                lambda gf, t: zoom_out(gf(t)))
+            video = video.crop(x1=x1, x2=x2, y1=0, y2=h)
     else:
-        video = video.crop(x1=x1, x2=x2, y1=0, y2=h).fl(
-            lambda gf, t: zoom_out(gf(t)))
+        video = video.crop(x1=x1, x2=x2, y1=0, y2=h)
 
     clip_start = clip_info['start']
     clip_end = clip_info['end']
