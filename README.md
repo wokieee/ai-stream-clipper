@@ -27,7 +27,7 @@ Turn long streams into viral, auto-captioned vertical shorts.
 | Words per line | How many words appear per caption line |
 | Caption font size | Fixed text size in pixels (40–120). Captions are a fixed size now, so they don't jump between tiny and huge across clips. |
 | Outline thickness | Thickness of the black text outline (2–20) |
-| Recenter on speaker | Tracks the speaker's face and keeps them centered. Snaps fast on a camera cut or speaker switch, and ignores single-frame detection flicker. |
+| Recenter on speaker | Frames the shot on the person talking. It scans the whole clip **first**, decides the framing like a human editor, then renders — it does not chase the face while the video plays. The crop stays completely still during a shot, snaps instantly on a camera cut, and only pans when someone genuinely walks across the frame. |
 
 **Logo overlay (optional):** open the "🏷️ Logo overlay" expander and drag in a
 PNG/JPG. Must be under 2MB — a logo is a small static image, not a photo.

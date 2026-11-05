@@ -857,31 +857,42 @@ def _get_face_detector():
     return _face_detector
 
 
-def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
-                        max_jump_frac=0.22, hold_frames=5):
+def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
+                      pan_time=0.5, drift_window=1.0, drift_min=1.0,
+                      min_face_frac=0.002):
     """
-    Sample frames and return a smoothed center-x track (function of time,
-    in source pixel coords) that follows the *speaker*, not the largest
-    face on screen.
+    Two-pass "AI editor" framing — NOT a real-time face follower.
 
-    Why this matters: picking the largest face per frame independently lets
-    a nearby animal (or any large object) hijack the crop every frame. The
-    speaker is rarely the biggest thing in frame — they are the face that
-    stays near where it was last.
+    Pass 1 (offline scan): step through the WHOLE clip at det_fps, run YuNet
+    on every detection frame, and reduce each frame to a target center-x:
+      * two comparable faces  -> average of the pair (center on both)
+      * otherwise             -> the largest face (speaker-size first)
+      * tiny boxes            -> ignored (distant-person false positives)
+    Targets are median-filtered within each shot so a one-frame detection
+    glitch or a flickering false positive can never move the crop.
+    HSV histogram correlation <0.85 marks scene cuts.
 
-    Strategy:
-      1. Seed from the opening seconds at the face that is detected in the
-         most frames at a given location — the speaker's facecam is present
-         in nearly every frame, while a passer-by or pet flickers in and
-         out. Size is only a tiebreak among equally-persistent faces.
-      2. Each frame, score every detected face by distance to the previous
-         tracked position. Closest candidate wins.
-      3. A candidate must be within max_jump_frac of the frame width from
-         the current track, otherwise we HOLD the previous position instead
-         of jumping to a distant animal.
-      4. The new position must be confirmed for hold_frames consecutive
-         frames before it can take over — flicker doesn't steal the lock.
-      5. Falls back to frame center when no face is found at all.
+    Pass 2 (the edit): turn the scan into a DECISIVE camera path — a
+    piecewise center-x-vs-time function built ONLY from three moves, exactly
+    what a human editor would do:
+
+      HOLD       a fixed crop for the whole shot. People talking, camera
+                 still -> crop does not move at all. No jitter, no crawl,
+                 no chasing while the video renders.
+      SNAP       instant reframe, allowed ONLY at scene cuts and at t=0.
+                 The picture itself changes at the same instant, so the cut
+                 hides the move — a new speaker on a new camera angle gets
+                 the center instantly, no crawl.
+      EASED PAN  when one speaker keeps drifting away from the held center
+                 (median over the last drift_window stays outside the
+                 deadband for drift_min straight seconds), the crop
+                 RECENTERS ONCE with a smooth ~pan_time eased move. A
+                 deliberate operator move, not a frame-by-frame follow.
+
+    The entire path exists BEFORE the first output frame is rendered, so
+    the renderer just applies it — detect first, then crop.
+
+    Returns: x_of(t) -> crop center-x in source pixels.
     """
     detector = _get_face_detector()
     w, h = video.size
@@ -889,235 +900,149 @@ def build_speaker_track(video, sample_step=5, smooth_sec=0.8,
     fps = video.fps or 24
     det_w = 640
     det_h = max(1, int(h * float(det_w) / w))
-    scale = w / det_w  # source px per small-frame px
-    max_jump = max_jump_frac * w
+    scale = w / det_w
 
-    times, xs = [], []
-    last_x = w / 2.0
-    pending_x = None        # candidate waiting for hold_frames confirmation
-    pending_first = None    # where that candidate first appeared
-    pending_count = 0
-    last_hist = None        # HSV histogram of the previous detection frame
-    last_faces = []         # most recent non-empty detection (reused in gaps)
-    n_frames = int(duration * fps)
-
-    def detect_at(i):
+    # ── Pass 1: offline scan ─────────────────────────────────────────────
+    step = max(1, int(round(fps / det_fps)))
+    n_frames = max(1, int(duration * fps))
+    samples = []          # (t, raw_target, is_cut)
+    last_hist = None
+    for i in range(0, n_frames, step):
         t = min(i / fps, max(0.0, duration - 0.01))
         frame = video.get_frame(t)
         small = cv2.resize(frame, (det_w, det_h))
-        # Histogram for scene-cut detection: two frames of the same shot
-        # correlate >0.85; a camera cut or hard scene change drops sharply.
         hist = cv2.calcHist([small], [0, 1], None, [16, 16],
                             [0, 256, 0, 256])
         cv2.normalize(hist, hist)
+        is_cut = (last_hist is not None and
+                  cv2.compareHist(last_hist, hist,
+                                  cv2.HISTCMP_CORREL) < 0.85)
+        last_hist = hist
         detector.setInputSize((det_w, det_h))
         rc, faces = detector.detect(small)
-        # YuNet returns (rc, faces). faces is an (N,15) array, or None when
-        # nothing is detected. Guard for both — len(None) raises TypeError,
-        # and that exception used to kill the WHOLE track and fall back to a
-        # static center crop (i.e. "it stopped recentering entirely").
-        # Return a plain list so callers can use `if not faces:` without
-        # numpy ambiguity errors.
-        if faces is None or len(faces) == 0:
-            return [], hist
-        return [tuple(f) for f in faces], hist
-
-    # ── Seed: find the most *persistent* face in the opening seconds ─────────
-    # Stream facecams sit anywhere in frame (often a corner), so starting from
-    # center and drifting would lock onto whatever is central (pet, mascot,
-    # overlay). The speaker's face is detected in nearly every frame; an
-    # animal/passer-by is not. Size is only a tiebreak.
-    seed_frames = list(range(0, min(n_frames, sample_step * 24), sample_step))
-    clusters = []  # list of [x_center_sum, count, size_sum] in det px
-    for i in seed_frames:
-        faces, _ = detect_at(i)
-        if not faces:
-            continue
-        for f in faces:
-            cx = (f[0] + f[2] / 2.0) * scale
-            for c in clusters:
-                if abs(c[0] / c[1] - cx) <= max_jump:
-                    c[0] += cx
-                    c[1] += 1
-                    c[2] += f[2] * f[3]
-                    break
-            else:
-                clusters.append([cx, 1, f[2] * f[3]])
-    if clusters:
-        # Persistence first, size as tiebreak
-        best_c = max(clusters, key=lambda c: (c[1], c[2]))
-        last_x = best_c[0] / best_c[1]
-
-    # Detection cadence. Measured on this machine: YuNet on a 640px frame
-    # takes ~14ms median, so even 25fps would be affordable. The real limit
-    # is that YuNet only detects a face on ~half the frames of real stream
-    # footage, so a per-frame detector just produces gaps. 5fps is a good
-    # balance — it reacts to a speaker switch within 0.2s, and the gaps
-    # between detections (the source of most of the "crawl") are small.
-    # (sample_step is the *display* cadence of the track; this is the
-    # detection cadence.)
-    det_step = 0.2  # seconds between detections
-
-    for i in range(0, n_frames, sample_step):
-        t = min(i / fps, max(0.0, duration - 0.01))
-        # Only run the (slow) detector at det_step cadence; reuse the last
-        # result in between. Detecting every frame was both slow and
-        # pointless — YuNet misses ~half the frames on real stream footage,
-        # so a per-frame detector just produced gaps.
-        if i % max(1, int(round(det_step * fps))) == 0:
-            faces, hist = detect_at(i)
-            # Keep the last NON-EMPTY detection. YuNet misses ~half the
-            # frames on real stream footage, so reusing an empty result in
-            # the gaps between detections would make the hold counter stall
-            # (no candidate to count) and the crop freeze — the "stops
-            # recentering" symptom. A stale-but-valid face is far better
-            # than no face at all for the hold gate.
-            if faces:
-                last_faces = faces
-            # Scene-cut detection. This is the key fix for interview / talk
-            # footage: the camera cuts between two speakers every few
-            # seconds, and a cut is a genuine scene change — the new frame
-            # is NOT a continuation of the old one, so the hold gate (which
-            # exists to reject detection flicker within a shot) should not
-            # apply. Two frames of the same shot correlate >0.85; a cut
-            # drops well below that, and we snap to the new face instantly.
-            #
-            # Without this the tracker held the old position through every
-            # cut (the hold counter never reached the threshold, because
-            # each cut's new face is far from the previous one), which is
-            # exactly the "crawls to the speaker / stops recentering" the
-            # user saw.
-            if last_hist is not None and hist is not None:
-                corr = cv2.compareHist(last_hist, hist, cv2.HISTCMP_CORREL)
-                if corr < 0.85:
-                    pending_x = None
-                    pending_count = 0
-            last_hist = hist
-        else:
-            faces = last_faces
-
-        chosen = None
+        target = None
+        if faces is not None and len(faces):
+            faces = [f for f in faces
+                     if f[2] * f[3] >= min_face_frac * det_w * det_h]
         if faces:
-            # When TWO people are on screen (a conversation), the honest
-            # answer is "center on both of them" — picking the biggest face
-            # made the crop lurch back and forth between the two speakers
-            # on every cut, which is exactly the ugly chasing the user saw.
-            # Averaging their positions keeps both in frame and the crop
-            # still. Only when one face is clearly dominant (a solo speaker)
-            # do we follow that single face.
             areas = [f[2] * f[3] for f in faces]
             total = sum(areas)
             biggest = max(areas)
             if len(faces) >= 2 and biggest < 1.6 * (total - biggest):
-                # Two comparable faces — center on the pair
-                cxs = [(f[0] + f[2] / 2.0) * scale for f in faces]
-                chosen = sum(cxs) / len(cxs)
+                target = (sum((f[0] + f[2] / 2.0) * scale for f in faces)
+                          / len(faces))
             else:
-                # Solo speaker, or one face dominates — follow it.
-                # FACE SIZE is the primary key, not proximity to the last
-                # position: the old distance-first sort made the crop chase
-                # whichever face happened to be nearest the previous frame.
-                def score(f):
-                    area = f[2] * f[3]
-                    cx = (f[0] + f[2] / 2.0) * scale
-                    return (-area, abs(cx - last_x))
+                cand = max(faces, key=lambda f: f[2] * f[3])
+                target = (cand[0] + cand[2] / 2.0) * scale
+        samples.append((t, target, is_cut))
 
-                cand = min(faces, key=score)
-                cand_x = (cand[0] + cand[2] / 2.0) * scale
-                # Absolute safety valve: never snap to something outside the
-                # frame (a detection glitch can report a huge box).
-                if 0 <= cand_x <= w:
-                    chosen = cand_x
+    # Shot ids (cut boundaries), then median-filter targets WITHIN a shot.
+    shot_ids, sid = [], 0
+    for _, _, cut in samples:
+        if cut:
+            sid += 1
+        shot_ids.append(sid)
+    filtered = []
+    for idx in range(len(samples)):
+        t, _, cut = samples[idx]
+        group = []
+        for j in (idx - 1, idx, idx + 1):
+            if 0 <= j < len(samples) and shot_ids[j] == shot_ids[idx]:
+                if samples[j][1] is not None:
+                    group.append(samples[j][1])
+        tgt = float(np.median(group)) if group else None
+        filtered.append((t, tgt, cut))
 
-        if chosen is not None:
-            # Adaptive hold: a candidate that persists for several frames
-            # is almost certainly a real new speaker, not detection flicker
-            # (flicker doesn't survive N frames). So the FARTHER the
-            # candidate is from the current track, the faster we accept it —
-            # a big persistent jump means a speaker switch, and those need
-            # to snap to the new face immediately instead of crawling.
-            #
-            # The counter compares against the position where the candidate
-            # FIRST appeared, not the previous frame's candidate. Comparing
-            # against the previous frame's candidate resets the counter
-            # whenever the new speaker is still walking across the frame —
-            # their detected position moves every frame, so the counter
-            # could never reach the threshold and the crop would crawl
-            # forever behind a moving speaker.
-            #
-            # Tolerance matters here: YuNet's box jitter is a few pixels,
-            # but a walking speaker's face moves much more per frame. A
-            # tight tolerance (<=0.5*max_jump) reset the counter on every
-            # frame of a real switch, so the crop never committed and just
-            # crawled. 12% of the frame width covers jitter plus a normal
-            # walking pace; a genuine new speaker on the other side of the
-            # frame still restarts the window, which is what we want.
-            if pending_x is None:
-                pending_x = chosen
-                pending_first = chosen
-                pending_count = 1
-            elif abs(chosen - pending_first) <= 0.12 * w:
-                pending_count += 1
+    # ── Pass 2: the edit ─────────────────────────────────────────────────
+    # State machine over the scan. Exactly one segment is "open" at a time:
+    # a HOLD at center `cur`, or a PAN from `pan_from` toward `cur` that
+    # finishes at `pan_end`. Segments close ONLY at events (scene cut, pan
+    # completion, pan start, clip end), and each close emits its piece as
+    # [seg_start, t_event] — so pieces tile the timeline exactly: no
+    # overlaps, no gaps, by construction. (The first attempt tracked pan
+    # end-times separately and produced overlapping pieces when a cut
+    # arrived mid-pan; this version cannot.)
+    pieces = []
+    cur = None            # center the crop holds, or is panning toward
+    seg_start = 0.0       # when the open segment began
+    seg_is_pan = False
+    pan_from = 0.0
+    pan_end = 0.0
+    drift = []            # (t, target) since the last commit
+    drift_since = None    # when the median first left the deadband
+
+    def close(t_end):
+        nonlocal seg_start, seg_is_pan
+        if cur is not None and t_end > seg_start:
+            x0 = pan_from if seg_is_pan else cur
+            pieces.append((seg_start, t_end, x0, cur))
+        seg_start = t_end
+        seg_is_pan = False
+
+    for t, tgt, cut in filtered:
+        if tgt is None:
+            continue
+        if cur is None:
+            # First trusted target: center on it from frame zero. The clip
+            # opens already framed on the speaker — no center-then-drift.
+            cur = tgt
+            seg_start = 0.0
+            continue
+        if cut:
+            # Scene cut: close the open segment at the cut and SNAP to the
+            # new speaker. The picture itself changes at this instant, so
+            # the cut hides the reframe — a pan in flight is simply cut
+            # short, the viewer never sees it finish.
+            close(t)
+            cur = tgt
+            drift, drift_since = [], None
+            continue
+        if seg_is_pan:
+            if t < pan_end:
+                continue            # wait out the pan; never steer mid-move
+            close(t)                # pan lands here; hold continues at cur
+            drift, drift_since = [], None
+            # fall through — this sample still feeds drift
+        drift.append((t, tgt))
+        recent = [x for (tt, x) in drift if t - tt <= drift_window]
+        if recent:
+            med = float(np.median(recent))
+            if abs(med - cur) > deadband_frac * w:
+                if drift_since is None:
+                    drift_since = t
+                if t - drift_since >= drift_min:
+                    # Deliberate reframe: ONE eased pan, then hold again.
+                    close(t)
+                    seg_is_pan = True
+                    pan_from = cur
+                    pan_end = t + pan_time
+                    cur = med
+                    drift, drift_since = [], None
             else:
-                # Candidate jumped again — restart the hold window at the
-                # new position. (A real speaker's face drifts slowly, so
-                # this only restarts for genuine new detections.)
-                pending_x = chosen
-                pending_first = chosen
-                pending_count = 1
-            dist = abs(pending_x - last_x)
-            if dist > 0.5 * w:
-                needed = 2        # speaker switch — snap fast
-            elif dist > 0.25 * w:
-                needed = 3
-            else:
-                needed = hold_frames
-            if pending_count >= needed:
-                last_x = pending_x
-                pending_x = None
-                pending_count = 0
-        # else: hold last_x (no jump to a distant animal)
+                drift_since = None
 
-        times.append(t)
-        xs.append(last_x)
-
-    if not times:
+    close(duration)
+    if not pieces:
         return lambda t: w / 2.0
+    # Clamp every center so the crop window stays inside the frame.
+    half = crop_w / 2.0
+    lo, hi = half, half + (w - crop_w)
+    pieces = [(a, b, min(hi, max(lo, xa)), min(hi, max(lo, xb)))
+              for (a, b, xa, xb) in pieces]
 
-    xs = np.array(xs, dtype=float)
-    times_a = np.array(times)
+    starts = np.array([p[0] for p in pieces])
 
-    # Adaptive smoothing. A fixed-width moving average is the wrong tool
-    # here: it smooths out the jitter you want gone AND the speaker switch
-    # you want instant. So the smoothing strength tracks how far the last
-    # accepted position moved:
-    #   small move  → strong smoothing (kill the jitter)
-    #   big move    → weak smoothing  (snap to the new speaker now)
-    # This is what makes the crop follow a new speaker immediately while
-    # still ignoring single-frame detection noise.
-    #
-    # The alpha values are tuned to the remaining jitter, which after the
-    # hold gate is mostly YuNet's box noise on a *stationary* speaker — a
-    # few pixels, not the ~100px jumps we were seeing before the fixes.
-    # A small-move alpha of 0.25 (rather than 0.35) cuts that residual jitter
-    # harder while still settling a real switch within a couple of frames.
-    alpha = 0.25                      # smoothing factor for a tiny move
-    jump_alpha = 0.9                  # ~no smoothing for a big speaker switch
-    xs_smooth = np.zeros_like(xs)
-    xs_smooth[0] = xs[0]
-    for i in range(1, len(xs)):
-        move = abs(xs[i] - xs[i - 1])
-        a = alpha if move <= 0.15 * w else (
-            jump_alpha if move >= 0.5 * w else
-            alpha + (jump_alpha - alpha) * ((move - 0.15 * w) / (0.35 * w))
-        )
-        xs_smooth[i] = xs_smooth[i - 1] + a * (xs[i] - xs_smooth[i - 1])
+    def x_of(t):
+        j = int(np.searchsorted(starts, t, side='right')) - 1
+        j = max(0, min(j, len(pieces) - 1))
+        t0, t1, xa, xb = pieces[j]
+        if xa == xb or t1 <= t0:
+            return float(xa)
+        u = min(1.0, max(0.0, (t - t0) / (t1 - t0)))
+        return float(xa + (xb - xa) * (u * u * (3.0 - 2.0 * u)))
 
-    def track(t):
-        return float(np.interp(t, times_a, xs_smooth))
-
-    return track
-
+    x_of.pieces = pieces   # exposed for measurement/debugging
+    return x_of
 
 # ─── Caption Rendering ────────────────────────────────────────────────────────
 def create_karaoke_image(full_text, highlight_word, word_index,
@@ -1343,23 +1268,28 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
     x1 = (w - new_w) // 2
     x2 = x1 + new_w
 
-    # ── Speaker tracking: recenter on the person talking ──────────────────────
+    # ── Speaker tracking (two-pass "AI editor"): scan first, then edit ─────────
     if speaker_track:
-        print("  🎯 Detecting speaker position (face tracking)...")
+        print("  🎯 Planning framing (offline scan) ...")
         try:
-            track = build_speaker_track(video, sample_step=10)
+            x_of = plan_crop_windows(video, new_w, det_fps=5.0)
             half = new_w / 2.0
             max_x1 = w - new_w
-
-            def crop_fn(get_frame, t, _track=track):
+            # Pieces are exposed on the returned function for measurement.
+            print("  📐 Planned %d window(s):" % len(getattr(x_of, 'pieces', [])))
+            for t0, t1, xa, xb in getattr(x_of, 'pieces', []):
+                kind = "HOLD" if abs(xa - xb) < 1 else "PAN"
+                print("    [%5.1f-%5.1f] %s center=%4.0f→%4.0f" %
+                      (t0, t1, kind, xa, xb))
+            def crop_fn(get_frame, t, _xof=x_of):
                 frame = get_frame(t)
-                x1 = int(round(max(0.0, min(max_x1, _track(t) - half))))
+                cx = float(_xof(t))
+                x1 = int(round(max(0.0, min(max_x1, cx - half))))
                 # Keep the crop width even — libx264 will reject odd widths.
                 return frame[:, x1:x1 + new_w]
-
             video = video.fl(crop_fn)
         except Exception as e:
-            print(f"  ⚠️  Face tracking failed ({e}), using static center crop")
+            print(f"  ⚠️  Framing planner failed ({e}), using static center crop")
             video = video.crop(x1=x1, x2=x2, y1=0, y2=h)
     else:
         video = video.crop(x1=x1, x2=x2, y1=0, y2=h)
@@ -1459,11 +1389,12 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
                     # Last word of the chunk must reach the NEXT chunk's
                     # first word, not just this chunk's end. Otherwise a
                     # 0.05–0.35s gap opens at every chunk boundary (a
-                    # frame with no caption at all).
+                    # frame with no caption at all). The final chunk's
+                    # last word runs to clip_duration, not chunk_end.
                     next_idx = chunk_idx + chunk_size
                     next_word_start = (word_list[next_idx]['start']
                                        if next_idx < len(word_list)
-                                       else chunk_end)
+                                       else clip_duration)
                 duration = max(0.1, next_word_start - word_start + 0.05)
 
                 img_np = create_karaoke_image(
