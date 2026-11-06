@@ -242,7 +242,30 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
     # is just random. A good clip starts on a real thought boundary and
     # ends on a natural break. Score that explicitly.
     best_near_miss = None  # longest clip that fits max_duration but not min
+
+    # ── Sentence-boundary starts ──────────────────────────────────────────
+    # A clip must OPEN on a real thought break. The old code let clips start
+    # at any segment boundary, but Whisper segments are only 2-3s and
+    # routinely cut a sentence in half — so a clip could start mid-sentence
+    # even while "starting at a segment" (the "' I was hiking..." case).
+    # Splitting the running transcript on sentence punctuation and marking
+    # the next segment as a start fixes that.
+    is_sentence_start = [False] * len(segments)
+    is_sentence_start[0] = True
+    buf = ""
+    for i in range(len(segments)):
+        if i > 0 and re.search(r'[.!?"]\s*$', buf):
+            is_sentence_start[i] = True
+        buf += " " + segments[i]['text'].strip()
+    # Safety: if the heuristic marked nothing, fall back to every boundary
+    # rather than returning zero candidates.
+    if not any(is_sentence_start[1:]):
+        is_sentence_start = [True] * len(segments)
+
     for i, seg in enumerate(segments):
+        # Only start a clip on a sentence boundary.
+        if i > 0 and not is_sentence_start[i]:
+            continue
         # Try to form a clip starting at this segment
         for j in range(i + 1, len(segments) + 1):
             clip_start = segments[i]['start']
@@ -283,22 +306,10 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             # random. Reward clips that begin and end on thought breaks.
 
             # START boundary: does the clip begin a new thought?
-            # - The first word is capitalized (proper start of a sentence)
-            # - The previous segment ended with sentence-ending punctuation
-            # - The first word is not a continuation word (but, and, so, the)
-            start_words = clip_words[:4]
-            first_word = start_words[0] if start_words else ""
-            starts_new_thought = False
-            if i == 0:
-                starts_new_thought = True  # nothing before it
-            else:
-                prev_text = segments[i - 1]['text'].strip()
-                prev_ends_sentence = bool(re.search(r'[.!?"]\s*$', prev_text))
-                continuation_words = {'but', 'and', 'so', 'the', 'that', 'which',
-                                      'because', 'although', 'while', 'if', 'when'}
-                if prev_ends_sentence or first_word.lower() not in continuation_words:
-                    starts_new_thought = True
-            start_bonus = 0.45 if starts_new_thought else 0.0
+            # is_sentence_start[i] is True when the running transcript had
+            # sentence-ending punctuation just before this segment, so the
+            # clip opens on a real break rather than mid-sentence.
+            start_bonus = 0.45 if is_sentence_start[i] else 0.0
 
             # END boundary: does the clip end on a natural break?
             # - Last segment ends with sentence-ending punctuation
@@ -369,23 +380,42 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             'word_count': len(segments[0]['text'].split()),
         }]
 
-    # Sort by score descending, then prefer non-overlapping clips
+    # Sort by score descending, then prefer non-overlapping clips.
+    #
+    # Two passes. Pass 1 is strict non-overlap, which is what most videos
+    # need. Pass 2 exists for the case the user actually hit: a short or
+    # very dense clip where every good candidate sits inside the same span,
+    # so pass 1 picks the single best clip and then rejects everything else
+    # -> "only 1 candidate no matter the max_clips setting". Pass 2 fills the
+    # quota with the best remaining clips that overlap the chosen ones by
+    # less than a small tolerance, so the slider can actually be obeyed.
     candidates.sort(key=lambda c: c['score'], reverse=True)
     selected = []
     used_spans = []
+    OVERLAP_TOLERANCE = 3.0  # seconds
+
+    def _overlaps(s, e, tol=0.0):
+        for (cs, ce) in used_spans:
+            if min(e, ce) - max(s, cs) > tol:
+                return True
+        return False
 
     for c in candidates:
-        # Skip if this clip overlaps significantly with an already selected one
-        overlap = False
-        for s, e in used_spans:
-            if c['start'] < e and c['end'] > s:
-                overlap = True
-                break
-        if not overlap:
+        if not _overlaps(c['start'], c['end']):
             selected.append(c)
             used_spans.append((c['start'], c['end']))
         if len(selected) >= max_clips:
             break
+
+    if len(selected) < max_clips:
+        for c in candidates:
+            if c in selected:
+                continue
+            if not _overlaps(c['start'], c['end'], OVERLAP_TOLERANCE):
+                selected.append(c)
+                used_spans.append((c['start'], c['end']))
+            if len(selected) >= max_clips:
+                break
 
     print(f"  Found {len(selected)} candidate clips (out of {len(candidates)} analyzed)")
     for c in selected:
