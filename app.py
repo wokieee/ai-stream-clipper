@@ -68,6 +68,27 @@ with st.sidebar:
         help="Tracks the face of the person talking and keeps them centered in the vertical crop.",
     )
 
+    # ── Focus prompt ───────────────────────────────────────────────────────
+    # Whop moderators often want a clip cut around a SPECIFIC topic or
+    # requirement ("the gaming moment", "the tech angle", "keep it under
+    # 30s and family-friendly"). This text is handed to the title/hashtag
+    # generator so the suggestions stay on-brief instead of drifting to
+    # whatever the model thinks is interesting. Leave it blank for the
+    # default behaviour.
+    with st.expander("🎯 Focus prompt (optional)", expanded=False):
+        focus_prompt = st.text_area(
+            "What should the clips focus on?",
+            placeholder=(
+                "e.g. the gaming moment, the tech discussion, keep it "
+                "family-friendly, the moderator wants the money talk..."
+            ),
+            height=70,
+            help="Free text. Used for title and hashtag suggestions only — "
+                 "it does not change which segments are detected.",
+        )
+        if focus_prompt:
+            st.caption(f"✓ Will steer titles toward: {focus_prompt[:60]}...")
+
     st.subheader("Info")
     st.markdown("""
     **How it works:**
@@ -218,6 +239,7 @@ if st.button("🚀 Process & Generate Clips", type="primary"):
                 logo_path=logo_path,
                 caption_style=caption_style.lower(),
                 font_size=caption_size,
+                focus=focus_prompt or None,
             )
             rendered_clips.append(meta)
 

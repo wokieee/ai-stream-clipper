@@ -580,6 +580,47 @@ _TOPIC_WORDS = {
 }
 
 
+# ─── Hook formulas ───────────────────────────────────────────────────────────
+# Research on viral short-form titles (Clipspeed, StoryCut, SendShort, and a
+# study of 200 viral YouTube Shorts on r/SmallYoutubers) shows the top
+# performers follow a handful of repeatable patterns. Rather than trusting
+# the LLM to invent one, we SCORE each candidate against these formulas and
+# only let the LLM supply the wording. The formulas are:
+#
+#   nobody   "Nobody talks about this…"        — an information gap
+#   trick    "You've been doing this wrong…"    — relatability / fix
+#   tried    "I tried this for 7 days…"         — a time-bound experiment
+#   changes  "This changes everything…"         — a game-changing reveal
+#   how_why  "How/Why/What…"                    — a question the viewer wants
+#                                              answered
+#   secret   "The secret to…" / "Nobody tells you…" — intrigue
+#
+# A title that hits two of these outperforms a generic descriptive one, so
+# we score the overlap rather than just looking for viral words.
+_HOOK_PATTERNS = [
+    (r'\bnobody (talks|tell|mentions|knows)\b', 'nobody'),
+    (r"\byou('ve|re|ll)? been doing (this|it) wrong\b", 'trick'),
+    (r'\bi tried (this|it) for\b', 'tried'),
+    (r'\bthis changes everything\b', 'changes'),
+    (r'\b(the )?(how|why|what) (do|did|is|are|was|were)\b', 'how_why'),
+    (r'\bthe secret (to|of)\b', 'secret'),
+    (r"\bnobody tells you\b", 'secret'),
+    (r'\b(no one|everyone) (should|needs to|has to)\b', 'nobody'),
+    (r'\bhow i (got|made|built|learned)\b', 'how_why'),
+    (r'\bwhat happened (next|after)\b', 'how_why'),
+]
+
+
+def _hook_score(text):
+    """How many viral hook formulas does this title hit? 0-3."""
+    low = text.lower()
+    hits = set()
+    for pat, name in _HOOK_PATTERNS:
+        if re.search(pat, low):
+            hits.add(name)
+    return len(hits)
+
+
 # ─── LLM helpers (optional — falls back gracefully when unavailable) ─────────
 # We try a chain of providers, in order:
 #   1. Ollama (localhost:11434) — your local gemma4:12b, no network, no rate
@@ -596,20 +637,47 @@ _llm_freellmapi_key = (os.environ.get("ANTHROPIC_API_KEY", "")
 _llm_freellmapi_model = "auto"
 
 
-def _llm_title_tags(transcript_text, max_tokens=1024):
+def _llm_title_tags(transcript_text, max_tokens=1024, focus=None):
     """
     Ask the LLM for a punchy title + hashtags directly from the transcript.
 
     Tries Ollama first (local, no rate limit, free), then freellmapi
     (free tokens, better formatting). Falls back to None when both fail.
+
+    focus: optional instruction from the user (e.g. "focus on the tech
+    angle", "the moderator wants the gaming moment"). When given it is
+    passed through so the title stays on-brief for Whop/moderator
+    requirements instead of drifting to whatever the LLM thinks is
+    interesting.
     """
     preview = transcript_text[:400].replace("\n", " ").strip()
+    focus_line = ""
+    if focus:
+        focus_line = (
+            "\nFOCUS: " + focus.strip()
+            + "\nStay on this topic. Do not invent a different angle."
+        )
     prompt = (
-        "Transcript: " + preview + "\n"
-        "Write a YouTube short title and hashtags for this clip.\n"
-        "Reply with exactly two lines:\n"
-        "TITLE: <punchy title that captures what the clip is about>\n"
-        "TAGS: #word1 #word2 #word3"
+        "You are writing a title for a viral YouTube Short cut from a "
+        "long stream. The title must STOP THE SCROLL.\n"
+        "Transcript: " + preview + focus_line + "\n"
+        "Rules:\n"
+        "- 4-9 words. Under 55 characters.\n"
+        "- Open with a hook: a question, 'Nobody talks about', 'You've been "
+        "doing this wrong', 'I tried this for 7 days', 'This changes "
+        "everything', or 'The secret to'.\n"
+        "- Name the actual subject. 'The Dog' beats 'It'.\n"
+        "- No generic adjectives: amazing, insane, crazy, epic, legendary, "
+        "mind-blowing. Say what happened instead.\n"
+        "- Never start with 'Um', 'So', 'Like', 'Well', 'Yeah', 'Okay'.\n"
+        "- Never end on a filler word: yeah, okay, thanks, like, right.\n"
+        "- Do not title-case every word. Only the first word and proper "
+        "nouns.\n"
+        "Reply with EXACTLY two lines and nothing else. The first line is "
+        "the title. The second line is the hashtags. Do not write a "
+        "sentence, do not explain yourself:\n"
+        "The Market Crash No One Predicted\n"
+        "#finance #market #trading #money #investing"
     )
     # Provider 1: Ollama (local, think disabled to avoid reasoning overhead)
     ollama_result = _try_ollama(prompt, max_tokens)
@@ -676,7 +744,14 @@ def _try_freellmapi(prompt, max_tokens):
 
 
 def _extract_title_tags(content):
-    """Parse TITLE: and TAGS: lines from an LLM response, with validation."""
+    """Parse TITLE: and TAGS: lines from an LLM response, with validation.
+
+    The strict format is requested, but local Ollama frequently ignores
+    it and just returns a plain title on the first line — verified: it
+    emitted "The Market Crash No One Predicted" with no TITLE: prefix at
+    all. So we accept either form, and fall back to the first non-empty
+    line as the title when no TITLE: line is present.
+    """
     if not content:
         return None, []
     title, tags = None, []
@@ -689,6 +764,16 @@ def _extract_title_tags(content):
         m = re.match(r"^(?:[-*\d.\s]*)?[Tt][Aa][Gg][Ss]\s*[:\-]\s*(.+)$", line)
         if m:
             tags = re.findall(r"#\w+", m.group(1))
+    # Fallback: no TITLE: line at all — take the first real line as the
+    # title, and pull any hashtags out of the whole response.
+    if not title:
+        for line in content.splitlines():
+            line = line.strip()
+            if line and not line.lower().startswith(('tags:', 'title:')):
+                title = line
+                break
+        if not tags:
+            tags = re.findall(r"#\w+", content)
     # ── Reject garbage outputs ────────────────────────────────────────
     if title and ('<' in title or '>' in title
                   or 'punchy title' in title.lower()
@@ -714,20 +799,33 @@ def _strip_emoji(text):
     ).strip()
 
 
-def suggest_title_and_hashtags(text, min_words=15):
+def suggest_title_and_hashtags(text, min_words=15, focus=None):
     """
     Generate a punchy title and hashtags from clip transcript text.
 
     Uses an LLM to understand the clip's topic, then derives a title from
     that understanding. Falls back to keyword scoring when the LLM is
     unavailable.
+
+    focus: optional free-text instruction (e.g. "the moderator wants the
+    gaming moment", "focus on the tech angle"). Passed to the LLM so the
+    title stays on-brief for Whop/moderator requirements instead of
+    drifting to whatever the LLM thinks is interesting. The local keyword
+    fallback ignores it — it cannot know about a topic it was not told.
     """
     text = re.sub(r"\s+", " ", text).strip()
 
     # ── LLM title + tags (soft-fail) ───────────────────────────────────────
     # One-shot: give the transcript, get a title + hashtags back. The LLM
     # actually understands the clip; the heuristics below just pick words.
-    llm_title, llm_tags = _llm_title_tags(text)
+    #
+    # The LLM suggestion is a CANDIDATE, not the answer. It is re-scored
+    # through the same hook-formula logic as the local fallback, so a
+    # flat LLM title ("The Reunion You Didn't Expect") gets rewritten into
+    # a hook ("Nobody Tells You About the Reunion") instead of being
+    # displayed as-is. That is what separates a title that stops the scroll
+    # from one that reads like it was written by an AI.
+    llm_title, llm_tags = _llm_title_tags(text, focus=focus)
     if llm_title:
         print(f"  [LLM title] {llm_title}")
     if llm_tags:
@@ -746,6 +844,10 @@ def suggest_title_and_hashtags(text, min_words=15):
         parts = re.split(r'\b(?:and|but|so|because|although|while|if|when)\b', s)
         expanded.extend(p.strip() for p in parts if p.strip())
     sentences = expanded or sentences
+    # The LLM's wording is a candidate too — it knows the subject even when
+    # the transcript is a mess. Score it alongside the transcript phrases.
+    if llm_title:
+        sentences.append(llm_title.strip())
 
     scored = []
     for s in sentences:
@@ -764,6 +866,17 @@ def suggest_title_and_hashtags(text, min_words=15):
         # Viral vocabulary bonus
         low = s.lower()
         score += 0.6 * sum(1 for w in _VIRAL_WORDS if re.search(r'\b' + re.escape(w) + r'\b', low))
+        # Hook formulas: a title that opens with one of the proven patterns
+        # ("Nobody talks about", "You've been doing this wrong", a question)
+        # outperforms a generic descriptive one. This is what the LLM
+        # version was missing — it just wrote whatever it thought.
+        score += 1.2 * _hook_score(s)
+        # The LLM candidate is already a complete, well-formed title — it
+        # understood the clip even when the transcript is a mess. Give it a
+        # baseline boost so it competes with the raw transcript phrases
+        # instead of losing to a truncated "Oh, I haven't seen you since".
+        if llm_title and s == llm_title.strip():
+            score += 1.5
         # Penalize leading filler
         if any(w in ('um', 'uh', 'ah', 'like', 'so', 'you know', 'okay', 'yeah')
                for w in words[:2]):
@@ -790,6 +903,9 @@ def suggest_title_and_hashtags(text, min_words=15):
                     s = 0.5
                     s += 0.7 * sum(1 for w in _VIRAL_WORDS
                                    if re.search(r'\b' + re.escape(w) + r'\b', low))
+                    # Hook formulas apply to windows too — a 6-word window
+                    # that opens with a question outscores one that doesn't.
+                    s += 1.2 * _hook_score(" ".join(window))
                     # Penalize windows that start mid-thought on a filler
                     if window and window[0].lower() in ('and', 'but', 'so', 'the', 'that'):
                         s -= 0.4
@@ -816,6 +932,7 @@ def suggest_title_and_hashtags(text, min_words=15):
                 s = 1.0
                 s += 0.7 * sum(1 for w in _VIRAL_WORDS
                                if re.search(r'\b' + re.escape(w) + r'\b', low))
+                s += 1.2 * _hook_score(low)
                 # Penalize windows that are mostly filler/function words
                 filler = sum(1 for w in window if w.lower() in _STOP_WORDS)
                 s -= 0.8 * filler
@@ -907,6 +1024,20 @@ def suggest_title_and_hashtags(text, min_words=15):
             # Re-add the '#' — the LLM tags were stripped above so the
             # same word could be deduped against the fixed filler tags.
             hashtags = ['#Shorts', '#Viral', '#fyp'] + ['#' + t for t in clean[:3]]
+    else:
+        # Local Ollama frequently returns a title and then stops — it
+        # never emits the TAGS line at all (verified: it returned just
+        # "The Market Crash No One Saw Coming"). Rather than falling back
+        # to the generic heuristic tags, pull the content words out of the
+        # LLM title itself — they are the most on-topic words available.
+        if llm_title:
+            words = [w.lower().strip(".,;:!?\"'()") for w in llm_title.split()]
+            tags = [w for w in words
+                    if len(w) >= 4 and w not in _HASHTAG_STOP
+                    and not w.endswith("'s")]
+            if tags:
+                hashtags = (['#Shorts', '#Viral', '#fyp']
+                            + ['#' + t.capitalize() for t in tags[:3]])
     return {'title': title, 'hashtags': hashtags}
 
 
@@ -1273,7 +1404,7 @@ def create_subtitle_image(text, img_width, img_height, font_size=None,
 def create_vertical_clip_with_captions(video_path, clip_info, transcript, output_filename,
                                         chunk_size=4, outline=12, speaker_track=True,
                                         logo_path=None, caption_style="karaoke",
-                                        font_size=72):
+                                        font_size=72, focus=None):
     """
     Create a vertical (9:16) clip with captions.
 
@@ -1302,6 +1433,9 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
         speaker_track: Whether to track the speaker's face (default True)
         logo_path: Path to a PNG/JPG logo overlay (optional)
         caption_style: "karaoke" or "subtitle" (default "karaoke")
+        focus: Optional free-text instruction steering the title and
+            hashtags (e.g. "the moderator wants the gaming moment").
+            Does not change which segments are detected.
 
     Returns:
         dict with 'path', 'title', 'hashtags' keys
@@ -1507,6 +1641,6 @@ def create_vertical_clip_with_captions(video_path, clip_info, transcript, output
     )
 
     # Generate title & hashtags
-    meta = suggest_title_and_hashtags(clip_info['text'])
+    meta = suggest_title_and_hashtags(clip_info['text'], focus=focus)
     meta['path'] = output_path
     return meta
