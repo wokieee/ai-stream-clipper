@@ -210,14 +210,177 @@ def transcribe_audio(video_path):
 
 
 # ─── Viral Clip Detection ─────────────────────────────────────────────────────
+def _fallback_clip(segments, min_duration):
+    """Nothing cleared the energy bar — return the opening segment bounded by
+    the user's own min_duration rather than nothing, or a hardcoded 30s chunk
+    that ignored the slider."""
+    end = min(segments[-1]['end'], segments[0]['start'] + min_duration)
+    text = " ".join(s['text'] for s in segments)
+    return [{
+        'start': segments[0]['start'], 'end': end,
+        'text': text,
+        'score': 0.5, 'duration': end - segments[0]['start'],
+        'word_count': len(text.split()),
+        'intensity': 0.0,
+    }]
+
+
+# ── Peak-grow tuning ───────────────────────────────────────────────────────
+# Energy of a single segment runs 0..1. This is the floor a segment must
+# clear to count as a peak at all — the real bar is usually higher, because
+# the threshold adapts to each transcript (see PEAK_PERCENTILE).
+PEAK_THRESHOLD = 0.40
+
+# Peaks are taken from the top PEAK_PERCENTILE of energy in THIS transcript,
+# or PEAK_THRESHOLD, whichever is higher. Adapting matters: the base Whisper
+# model is inconsistent about emitting "?" and "!", so a fixed bar tuned on
+# one transcript finds no peaks at all on another. Taking a percentile means
+# every transcript yields its strongest moments.
+PEAK_PERCENTILE = 92
+
+# Growth stops at a silence gap bigger than this. Whisper segments within one
+# thought are back-to-back; a gap means the stream paused or cut. Measured on
+# the real 130-min transcript: 12% of gaps exceed 1.5s, and that is exactly
+# the thought-seam density that makes clip lengths spread.
+GAP_TOLERANCE = 1.5  # seconds
+
+
+def _percentile(values, pct):
+    """Linear-index percentile, no numpy dependency."""
+    s = sorted(values)
+    if not s:
+        return 0.0
+    k = max(0, min(len(s) - 1, int(round(pct / 100.0 * (len(s) - 1)))))
+    return s[k]
+
+
+def _clean_words(text):
+    return [w.lower().strip(".,;:!?\"'()") for w in text.split()]
+
+
+def _signal_words(text):
+    """Words in this text that carry a topic or a viral charge."""
+    return [w for w in _clean_words(text)
+            if len(w) >= 4 and w not in _STOP_WORDS
+            and (w in _TOPIC_WORDS or w in _VIRAL_WORDS)]
+
+
+def _seg_energy(seg):
+    """How notable one segment is, 0..1.
+
+    The per-sentence version of the old clip-level intensity: a question is a
+    hook the viewer wants answered, an exclamation is an emotional peak, and
+    a viral/topic word is a searchable subject. Normalised so one strong
+    sentence (a question plus a viral word) is a full 1.0.
+    """
+    text = seg.get('text', '') or ''
+    words = _clean_words(text)
+    e = 0.0
+    if '?' in text:
+        e += 0.5
+    if '!' in text:
+        e += 0.35
+    if any(w in _VIRAL_WORDS for w in words):
+        e += 0.35
+    if any(w in _TOPIC_WORDS for w in words):
+        e += 0.25
+    return min(1.0, e / 0.85)
+
+
+def _make_candidate(segments, l, r, energy, is_sentence_start):
+    """Score the clip covering segments[l..r] inclusive."""
+    clip = segments[l:r + 1]
+    clip_text = " ".join(s['text'] for s in clip)
+    clip_words = clip_text.split()
+    word_count = len(clip_words)
+    duration = segments[r]['end'] - segments[l]['start']
+
+    # Peak energy inside the clip — what the clip is being cut FOR.
+    intensity = max(energy[l:r + 1])
+
+    # DENSITY: words per second, peaking at 4 wps (conversational speech).
+    wps = word_count / max(duration, 0.1)
+    if 1.5 < wps < 10:
+        density_score = 1.0 - abs(wps - 4.0) / 4.0
+    else:
+        density_score = 0.3
+
+    # START boundary: does the clip open on a real thought break?
+    start_bonus = 0.45 if is_sentence_start[l] else 0.0
+
+    # END boundary: does it land on one, rather than cutting mid-sentence?
+    last_text = segments[r]['text'].strip()
+    ends_clean = bool(re.search(r'[.!?"]\s*$', last_text))
+    if not ends_clean and r + 1 < len(segments):
+        if re.match(r'^[A-Z]', segments[r + 1]['text'].strip()):
+            ends_clean = True
+    end_bonus = 0.45 if ends_clean else 0.0
+
+    # Hook: does the opening line carry a subject rather than filler?
+    hook_words = _clean_words(" ".join(clip_words[:5]))
+    hook_bonus = 0.25 if (any(w in _TOPIC_WORDS for w in hook_words)
+                          or any(w in _VIRAL_WORDS for w in hook_words)) else 0.0
+
+    lower = clip_text.strip().lower().split()
+    filler_start = any(t in ('um', 'uh', 'ah', 'like', 'you know', 'so')
+                       for t in lower[:3])
+    filler_end = any(t in ('um', 'uh', 'ah', 'okay', 'yeah') for t in lower[-2:])
+    filler_penalty = 0.35 if (filler_start or filler_end) else 0.0
+
+    # Coherence is now mostly a side-effect of how the clip was grown (it
+    # stops at a topic change), so this is a small nudge, not a gate.
+    distinct = len(set(_signal_words(clip_text)))
+    if distinct <= 1:
+        coherence_bonus = 0.15
+    elif distinct == 2:
+        coherence_bonus = 0.05
+    else:
+        coherence_bonus = -0.15
+
+    score = max(0, intensity + density_score * 0.5 + coherence_bonus
+                + start_bonus + end_bonus + hook_bonus - filler_penalty)
+
+    return {
+        'start': segments[l]['start'],
+        'end': segments[r]['end'],
+        'text': clip_text,
+        'score': score,
+        'duration': duration,
+        'word_count': word_count,
+        'intensity': round(intensity, 2),
+    }
+
+
 def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=10):
     """
-    Score each potential clip and return the best ones.
+    Find viral moments using peak-grow.
 
-    A "viral" moment is one with:
-    - Good word density (not too sparse, not a wall of text)
-    - Reasonable length (10-60 seconds)
-    - No dead air at start/end
+    The old scorer scored EVERY possible clip window and picked the highest
+    total. That has two fatal flaws, both reproduced on a synthetic 1-hour
+    stream with 8 topic blocks:
+
+      1. DURATION COLLAPSE. "Intensity" saturates at 1.0 for any window
+         around a peak, so a 30s window and a 60s window around the same
+         peak TIE. The tiebreak (duration_bonus) favours the shorter one,
+         so every clip collapses to min_duration — exactly the bug reported:
+         "every short being made are exact 30 secs only". A score-per-window
+         approach cannot spread durations, because a window's score is not
+         monotonic in length and the tiebreak always picks the short end.
+
+      2. O(n^2) ON LONG STREAMS. Enumerating every (start, end) pair is
+         quadratic. A 2-hour stream has thousands of Whisper segments, so
+         this was scoring millions of candidates — the "clipper breaks on
+         hour-plus videos" symptom.
+
+    This replaces it with peak-grow, the pattern the highlight-detection
+    research converges on (SVHighlights, MDPI TimeSformer, Microsoft
+    pairwise ranking, OpenClip): score the SEGMENTS, find the local maxima,
+    then grow each clip outward from the peak while the topic holds.
+
+    Growing outward is what makes durations spread: a clip keeps growing
+    until it hits min_duration, max_duration, a topic change, or a
+    silence/low-energy stretch. A flat filler stretch never grows a clip,
+    so the length is decided by content, not by a tiebreak.
 
     Args:
         max_clips: How many clips to return. The old hard-coded limit of 5
@@ -228,20 +391,6 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
     segments = transcript.get('segments', [])
     if not segments:
         return []
-
-    # Build a list of all candidate clips from consecutive segments
-    candidates = []
-    current_start = segments[0]['start']
-    current_end = segments[-1]['end']
-    all_text = " ".join(s['text'] for s in segments)
-    total_words = len(all_text.split())
-    total_duration = current_end - current_start
-
-    # Slide through segments, collecting clips within duration bounds
-    # Boundary-awareness: a clip that starts mid-joke and ends mid-sentence
-    # is just random. A good clip starts on a real thought boundary and
-    # ends on a natural break. Score that explicitly.
-    best_near_miss = None  # longest clip that fits max_duration but not min
 
     # ── Sentence-boundary starts ──────────────────────────────────────────
     # A clip must OPEN on a real thought break. The old code let clips start
@@ -262,171 +411,135 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
     if not any(is_sentence_start[1:]):
         is_sentence_start = [True] * len(segments)
 
-    for i, seg in enumerate(segments):
-        # Only start a clip on a sentence boundary.
-        if i > 0 and not is_sentence_start[i]:
+    # ── Per-segment energy (O(n), not O(n^2)) ────────────────────────────
+    # Score every segment once. The old scorer re-scored the same segments
+    # for every (start, end) pair, which is quadratic — a 2-hour stream has
+    # thousands of segments and was scoring millions of windows.
+    energy = [_seg_energy(s) for s in segments]
+
+    # ── Find peaks ────────────────────────────────────────────────────────
+    # The bar adapts to the transcript: the top PEAK_PERCENTILE of segment
+    # energies, never lower than PEAK_THRESHOLD. A peak must also be a local
+    # maximum within ±5 segments, so a plateau yields ONE peak, not six.
+    bar = max(PEAK_THRESHOLD, _percentile(energy, PEAK_PERCENTILE))
+    peaks = []
+    for i in range(len(segments)):
+        if energy[i] < bar:
             continue
-        # Try to form a clip starting at this segment
-        for j in range(i + 1, len(segments) + 1):
-            clip_start = segments[i]['start']
-            clip_end = segments[j - 1]['end']
-            duration = clip_end - clip_start
+        lo = max(0, i - 5)
+        hi = min(len(segments) - 1, i + 5)
+        if energy[i] >= max(energy[lo:hi + 1]) - 1e-9:
+            if peaks and i - peaks[-1] <= 3:
+                # two peaks too close together — keep the stronger one so
+                # they don't grow into duplicate clips of the same moment
+                if energy[i] > energy[peaks[-1]]:
+                    peaks[-1] = i
+            else:
+                peaks.append(i)
+    # Order by energy and cap the work: max_clips clips can never need more
+    # than a handful of peaks each.
+    peaks.sort(key=lambda i: energy[i], reverse=True)
+    peaks = peaks[:max_clips * 5]
 
-            if duration > max_duration:
+    # ── Grow each peak outward ─────────────────────────────────────────────
+    # Widen the window one segment at a time, always growing whichever side
+    # keeps the peak centred, until BOTH sides hit a silence gap, max_duration
+    # or the end of the transcript. Length is then decided by how much
+    # unbroken speech surrounds the peak — which is what makes durations
+    # spread. Two gates tried here are deliberately NOT used:
+    #   * an energy gate, because most ordinary connective sentences score 0
+    #     and growth died at the peak (then the min-duration pad pinned every
+    #     clip to exactly min_duration — the original bug, reproduced twice);
+    #   * a word-overlap topic gate, because consecutive sentences on the same
+    #     subject almost never share vocabulary ("roblox" then "raid"), so it
+    #     tripped on the first neighbour and blocked all growth.
+    # Off-topic material is handled where it belongs: in scoring, which
+    # penalises clips whose vocabulary spans several unrelated subjects.
+    candidates = []
+    for p in peaks:
+        l = r = p
+        # Growth is stopped by SILENCE GAPS only, not by word-overlap topic
+        # matching: consecutive sentences on the same subject almost never
+        # share exact vocabulary ("roblox" then "raid"), so a word gate
+        # blocked growth on the first neighbour and pinned every clip to
+        # min_duration — the original bug. Silence is what separates
+        # thoughts in real streams, and the scoring pass still penalises
+        # clips whose vocabulary spans several unrelated subjects.
+        # Each round grows whichever side keeps the window centred on the
+        # peak, until both sides are blocked (gap / end / max_duration).
+        def _can_grow(l, r, d):
+            """True if the window [l, r] can extend by d segments (d<0 left,
+            d>0 right) without crossing a silence gap or max_duration."""
+            nl, nr = l + min(d, 0), r + max(d, 0)
+            if nl < 0 or nr >= len(segments):
+                return False
+            if segments[nr]['end'] - segments[nl]['start'] > max_duration:
+                return False
+            if d < 0:
+                return segments[l]['start'] - segments[nl]['end'] <= GAP_TOLERANCE
+            return segments[nr]['start'] - segments[r]['end'] <= GAP_TOLERANCE
+
+        while _can_grow(l, r, -1 if (p - l) <= (r - p) else 1) or \
+              _can_grow(l, r, 1 if (p - l) <= (r - p) else -1):
+            if (p - l) <= (r - p):
+                if _can_grow(l, r, -1):
+                    l -= 1
+                else:
+                    r += 1
+            else:
+                if _can_grow(l, r, 1):
+                    r += 1
+                else:
+                    l -= 1
+
+        # If content alone couldn't reach min_duration, pad outward
+        # regardless of gap (but still within max_duration) — the user
+        # asked for at least min seconds of context around the peak.
+        while segments[r]['end'] - segments[l]['start'] < min_duration:
+            can_l = l > 0 and segments[r]['end'] - segments[l - 1]['start'] <= max_duration
+            can_r = (r < len(segments) - 1
+                     and segments[r + 1]['end'] - segments[l]['start'] <= max_duration)
+            if not can_l and not can_r:
                 break
-            if duration < min_duration:
-                # Too short to qualify, but remember the longest one that
-                # fit max_duration. If NOTHING reaches min_duration (e.g.
-                # the user set min=60/max=60 and the footage has no 60s
-                # speech block), we return this instead of the old
-                # hardcoded 30-second chunk that ignored the user's setting.
-                if best_near_miss is None or duration > best_near_miss['duration']:
-                    best_near_miss = {
-                        'start': clip_start, 'end': clip_end,
-                        'text': " ".join(s['text'] for s in segments[i:j]),
-                        'score': 0.5, 'duration': duration,
-                        'word_count': len(" ".join(s['text'] for s in segments[i:j]).split()),
-                    }
-                continue
-
-            clip_text = " ".join(s['text'] for s in segments[i:j])
-            clip_words = clip_text.split()
-            word_count = len(clip_words)
-
-            # ── Viral signals ────────────────────────────────────────────
-            # Research on highlight detection (SVHighlights, MDPI
-            # TimeSformer, Microsoft pairwise ranking, OpenClip) converges
-            # on four signals that separate a clip someone will rewatch from
-            # one they will skip past. Each is cheap to compute from a
-            # transcript alone:
-            #
-            #   intensity   how much the speaker is doing something notable —
-            #               a question, an exclamation, a viral word, a
-            #               change of topic. Peaks in intensity are the
-            #               moments worth cutting to.
-            #   density     words per second. Conversational speech is 2-8
-            #               wps; a wall of text or dead air is not.
-            #   boundary    does the clip open on a thought break and land
-            #               on one? A clip that starts mid-sentence feels
-            #               random to a viewer.
-            #   hook        does the opening line have a real subject or a
-            #               viral word, rather than filler?
-
-            # INTENSITY: how much the clip PEAKS. Accumulate the viral signals across
-            # EVERY sentence in the clip, then normalise by duration, so a
-            # 16s clip with three questions and a viral word outscores a
-            # 49s clip that meanders through one topic sentence.
-            #
-            # This is the signal the old scorer was missing — it rewarded
-            # density and boundaries but never asked whether the clip
-            # actually peaked anywhere. Research on highlight detection
-            # (SVHighlights, MDPI TimeSformer, Microsoft pairwise ranking)
-            # converges on exactly this: score the segment, then cut to the
-            # local maxima.
-            intensity = 0.0
-            for s in segments[i:j]:
-                words = [w.lower().strip(".,;:!?\"'()") for w in s['text'].split()]
-                if '?' in s['text']:   intensity += 0.5   # a hook the viewer wants answered
-                if '!' in s['text']:   intensity += 0.35  # an emotional peak
-                if any(w in _VIRAL_WORDS for w in words):   intensity += 0.35
-                if any(w in _TOPIC_WORDS for w in words):   intensity += 0.25
-            intensity = min(1.0, intensity / max(duration, 0.1))  # peaks/sec, capped
-
-            # DENSITY: words per second, peak at 4 wps
-            wps = word_count / max(duration, 0.1)
-            if 1.5 < wps < 10:
-                density_score = 1.0 - abs(wps - 4.0) / 4.0
+            if can_l and (not can_r or (p - l) <= (r - p)):
+                l -= 1
             else:
-                density_score = 0.3
+                r += 1
 
-            # START boundary: does the clip begin a new thought?
-            # is_sentence_start[i] is True when the running transcript had
-            # sentence-ending punctuation just before this segment, so the
-            # clip opens on a real break rather than mid-sentence.
-            start_bonus = 0.45 if is_sentence_start[i] else 0.0
+        # ── Snap the cut points to sentence boundaries ────────────────────
+        # Growth stops at WHATEVER segment edge blocked it, but Whisper
+        # segments are 2-3s and routinely cut a sentence in half, so a clip
+        # could open with the tail of the previous thought ("Six. Oh, you
+        # can..."). Walk the ends inward to the nearest real sentence break
+        # — but never past the peak, never below min_duration. The previous
+        # sentence-boundary fix enforced this for window starts; peak-grow
+        # has no window starts, so it must snap explicitly.
+        while (l < p and not is_sentence_start[l]
+               and segments[r]['end'] - segments[l + 1]['start'] >= min_duration):
+            l += 1
 
-            # END boundary: does the clip end on a natural break?
-            # - Last segment ends with sentence-ending punctuation
-            # - Or the next segment starts a new sentence (so the clip
-            #   didn't cut off mid-thought)
-            last_text = segments[j - 1]['text'].strip()
-            ends_clean = bool(re.search(r'[.!?"]\s*$', last_text))
-            if not ends_clean and j < len(segments):
-                next_text = segments[j]['text'].strip()
-                next_starts_new = bool(re.match(r'^[A-Z]', next_text))
-                if next_starts_new:
-                    ends_clean = True
-            end_bonus = 0.45 if ends_clean else 0.0
+        def _ends_sentence(k):
+            txt = segments[k]['text'].strip()
+            if re.search(r'[.!?"]\s*$', txt):
+                return True
+            if k + 1 < len(segments) and re.match(r'^[A-Z]', segments[k + 1]['text'].strip()):
+                return True
+            return False
 
-            # Hook: is there a topic or viral word in the first few words?
-            hook_words = [w.lower().strip(".,;:!?") for w in clip_words[:5]]
-            has_hook = (any(w in _TOPIC_WORDS for w in hook_words)
-                        or any(w in _VIRAL_WORDS for w in hook_words))
-            hook_bonus = 0.25 if has_hook else 0.0
+        while (r > p and not _ends_sentence(r)
+               and segments[r - 1]['end'] - segments[l]['start'] >= min_duration):
+            r -= 1
 
-            # Prefer clips that don't start/end with filler words
-            filler_start = any(t in ('um', 'uh', 'ah', 'like', 'you know', 'so')
-                               for t in clip_text.strip().lower().split()[:3])
-            filler_end = any(t in ('um', 'uh', 'ah', 'okay', 'yeah')
-                             for t in clip_text.strip().lower().split()[-2:])
-            filler_penalty = 0.35 if (filler_start or filler_end) else 0.0
-
-            # Duration bonus: shorter clips (15-30s) tend to perform better
-            if 15 <= duration <= 30:
-                duration_bonus = 0.2
-            elif duration <= 60:
-                duration_bonus = 0.1
-            else:
-                duration_bonus = 0.0
-
-            # Intensity is the headline signal — a clip that peaks somewhere
-            # is worth cutting to. Density, boundaries and hook are the
-            # tiebreakers that keep the cut clean.
-            score = max(0, intensity * 1.0 + density_score * 0.5
-                        + start_bonus + end_bonus + hook_bonus
-                        + duration_bonus - filler_penalty)
-
-            candidates.append({
-                'start': clip_start,
-                'end': clip_end,
-                'text': clip_text,
-                'score': score,
-                'duration': duration,
-                'word_count': word_count,
-                'intensity': round(intensity, 2),
-            })
+        dur = segments[r]['end'] - segments[l]['start']
+        if dur < min_duration or dur > max_duration:
+            continue
+        candidates.append(_make_candidate(segments, l, r, energy, is_sentence_start))
 
     if not candidates:
-        # Nothing met the min/max duration window. Rather than silently
-        # returning a hardcoded 30-second chunk that ignored the user's
-        # min_duration setting (which is what produced "min=60, got 30s"),
-        # return the longest clip that at least fit max_duration. If even
-        # that is missing, take the first chunk bounded by the user's own
-        # min_duration so the output at least respects the slider.
-        if best_near_miss:
-            print("  ⚠️  No clip reached the min duration — returning the "
-                  "longest available clip instead.")
-            return [best_near_miss]
-        fallback_end = min(segments[-1]['end'],
-                           segments[0]['start'] + min_duration)
-        return [{
-            'start': segments[0]['start'],
-            'end': fallback_end,
-            'text': segments[0]['text'],
-            'score': 0.5,
-            'duration': fallback_end - segments[0]['start'],
-            'word_count': len(segments[0]['text'].split()),
-        }]
+        return _fallback_clip(segments, min_duration)
 
-    # Sort by score descending, then prefer non-overlapping clips.
-    #
-    # Two passes. Pass 1 is strict non-overlap, which is what most videos
-    # need. Pass 2 exists for the case the user actually hit: a short or
-    # very dense clip where every good candidate sits inside the same span,
-    # so pass 1 picks the single best clip and then rejects everything else
-    # -> "only 1 candidate no matter the max_clips setting". Pass 2 fills the
-    # quota with the best remaining clips that overlap the chosen ones by
-    # less than a small tolerance, so the slider can actually be obeyed.
+    # Sort by score, then pick non-overlapping clips (two passes so the
+    # max_clips slider is actually obeyed — see the OVERLAP_TOLERANCE note).
     candidates.sort(key=lambda c: c['score'], reverse=True)
     selected = []
     used_spans = []
@@ -455,10 +568,11 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             if len(selected) >= max_clips:
                 break
 
-    print(f"  Found {len(selected)} candidate clips (out of {len(candidates)} analyzed)")
+    print(f"  Found {len(selected)} clips ({len(candidates)} peaks analyzed)")
     for c in selected:
-        print(f"    [{c['start']:.1f}s-{c['end']:.1f}s] score={c['score']:.2f} | {c['word_count']}w {c['duration']:.0f}s | {c['text'][:60]}...")
-
+        print(f"    [{c['start']:.1f}s-{c['end']:.1f}s] score={c['score']:.2f} "
+              f"| {c['word_count']}w {c['duration']:.0f}s int={c['intensity']:.2f} "
+              f"| {c['text'][:60]}...")
     return selected
 
 
