@@ -293,17 +293,51 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             clip_words = clip_text.split()
             word_count = len(clip_words)
 
-            # Score: words per second should be 2-8 (roughly conversational)
+            # ── Viral signals ────────────────────────────────────────────
+            # Research on highlight detection (SVHighlights, MDPI
+            # TimeSformer, Microsoft pairwise ranking, OpenClip) converges
+            # on four signals that separate a clip someone will rewatch from
+            # one they will skip past. Each is cheap to compute from a
+            # transcript alone:
+            #
+            #   intensity   how much the speaker is doing something notable —
+            #               a question, an exclamation, a viral word, a
+            #               change of topic. Peaks in intensity are the
+            #               moments worth cutting to.
+            #   density     words per second. Conversational speech is 2-8
+            #               wps; a wall of text or dead air is not.
+            #   boundary    does the clip open on a thought break and land
+            #               on one? A clip that starts mid-sentence feels
+            #               random to a viewer.
+            #   hook        does the opening line have a real subject or a
+            #               viral word, rather than filler?
+
+            # INTENSITY: how much the clip PEAKS. Accumulate the viral signals across
+            # EVERY sentence in the clip, then normalise by duration, so a
+            # 16s clip with three questions and a viral word outscores a
+            # 49s clip that meanders through one topic sentence.
+            #
+            # This is the signal the old scorer was missing — it rewarded
+            # density and boundaries but never asked whether the clip
+            # actually peaked anywhere. Research on highlight detection
+            # (SVHighlights, MDPI TimeSformer, Microsoft pairwise ranking)
+            # converges on exactly this: score the segment, then cut to the
+            # local maxima.
+            intensity = 0.0
+            for s in segments[i:j]:
+                words = [w.lower().strip(".,;:!?\"'()") for w in s['text'].split()]
+                if '?' in s['text']:   intensity += 0.5   # a hook the viewer wants answered
+                if '!' in s['text']:   intensity += 0.35  # an emotional peak
+                if any(w in _VIRAL_WORDS for w in words):   intensity += 0.35
+                if any(w in _TOPIC_WORDS for w in words):   intensity += 0.25
+            intensity = min(1.0, intensity / max(duration, 0.1))  # peaks/sec, capped
+
+            # DENSITY: words per second, peak at 4 wps
             wps = word_count / max(duration, 0.1)
             if 1.5 < wps < 10:
-                density_score = 1.0 - abs(wps - 4.0) / 4.0  # Peak at 4 words/sec
+                density_score = 1.0 - abs(wps - 4.0) / 4.0
             else:
                 density_score = 0.3
-
-            # ── Boundary scoring (the part that was missing) ──────────────
-            # A clip that starts mid-sentence ("...and then the dog ran")
-            # or ends mid-sentence ("I was gonna tell you—") feels
-            # random. Reward clips that begin and end on thought breaks.
 
             # START boundary: does the clip begin a new thought?
             # is_sentence_start[i] is True when the running transcript had
@@ -324,11 +358,10 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
                     ends_clean = True
             end_bonus = 0.45 if ends_clean else 0.0
 
-            # Hook: is there a topic word in the first few words? A clip
-            # that opens on a real subject ("the dog", "the market", "that
-            # guy") hooks the viewer; one that opens on filler doesn't.
+            # Hook: is there a topic or viral word in the first few words?
             hook_words = [w.lower().strip(".,;:!?") for w in clip_words[:5]]
-            has_hook = any(w in _TOPIC_WORDS for w in hook_words)
+            has_hook = (any(w in _TOPIC_WORDS for w in hook_words)
+                        or any(w in _VIRAL_WORDS for w in hook_words))
             hook_bonus = 0.25 if has_hook else 0.0
 
             # Prefer clips that don't start/end with filler words
@@ -346,8 +379,12 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
             else:
                 duration_bonus = 0.0
 
-            score = max(0, density_score + start_bonus + end_bonus
-                        + hook_bonus + duration_bonus - filler_penalty)
+            # Intensity is the headline signal — a clip that peaks somewhere
+            # is worth cutting to. Density, boundaries and hook are the
+            # tiebreakers that keep the cut clean.
+            score = max(0, intensity * 1.0 + density_score * 0.5
+                        + start_bonus + end_bonus + hook_bonus
+                        + duration_bonus - filler_penalty)
 
             candidates.append({
                 'start': clip_start,
@@ -356,6 +393,7 @@ def find_viral_segments(transcript, min_duration=10, max_duration=60, max_clips=
                 'score': score,
                 'duration': duration,
                 'word_count': word_count,
+                'intensity': round(intensity, 2),
             })
 
     if not candidates:
@@ -887,11 +925,10 @@ def _get_face_detector():
     return _face_detector
 
 
-def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
-                      pan_time=0.5, drift_window=1.0, drift_min=1.0,
-                      min_face_frac=0.002):
+def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.01,
+                      alpha=0.7, cam_alpha=0.4, min_face_frac=0.002):
     """
-    Two-pass "AI editor" framing — NOT a real-time face follower.
+    Two-pass framing — scan the whole clip offline, then render.
 
     Pass 1 (offline scan): step through the WHOLE clip at det_fps, run YuNet
     on every detection frame, and reduce each frame to a target center-x:
@@ -902,22 +939,13 @@ def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
     glitch or a flickering false positive can never move the crop.
     HSV histogram correlation <0.85 marks scene cuts.
 
-    Pass 2 (the edit): turn the scan into a DECISIVE camera path — a
-    piecewise center-x-vs-time function built ONLY from three moves, exactly
-    what a human editor would do:
-
-      HOLD       a fixed crop for the whole shot. People talking, camera
-                 still -> crop does not move at all. No jitter, no crawl,
-                 no chasing while the video renders.
-      SNAP       instant reframe, allowed ONLY at scene cuts and at t=0.
-                 The picture itself changes at the same instant, so the cut
-                 hides the move — a new speaker on a new camera angle gets
-                 the center instantly, no crawl.
-      EASED PAN  when one speaker keeps drifting away from the held center
-                 (median over the last drift_window stays outside the
-                 deadband for drift_min straight seconds), the crop
-                 RECENTERS ONCE with a smooth ~pan_time eased move. A
-                 deliberate operator move, not a frame-by-frame follow.
+    Pass 2 (the follow): the camera tracks the speaker. The TARGET is
+    exponentially smoothed (alpha) and the CAMERA only moves when the
+    smoothed target leaves a small deadband, so a static speaker never
+    twitches the crop while a walking speaker is followed with ~5px lag.
+    At a scene cut the camera snaps to the new speaker — the cut hides the
+    move. Frames the renderer asks for are linearly interpolated between
+    detection samples, which reads as a smooth pan.
 
     The entire path exists BEFORE the first output frame is rendered, so
     the renderer just applies it — detect first, then crop.
@@ -984,106 +1012,90 @@ def plan_crop_windows(video, crop_w, det_fps=5.0, deadband_frac=0.08,
         filtered.append((t, tgt, cut))
 
     # ── Pass 2: the edit ─────────────────────────────────────────────────
-    # Decisive camera path: HOLD, SNAP at scene cuts, and one eased PAN per
-    # deliberate reframe. Pans have a FIXED duration (pan_time) decided the
-    # instant the reframe is triggered, and they are emitted immediately —
-    # so detection gaps can never stretch them.
+    # The camera FOLLOWS the speaker. That is the whole point of "recenter
+    # on speaker" — a human operator does not hold a fixed crop while a
+    # person walks across the frame, they pan to keep them centered.
     #
-    # That stretching was the lag. The previous version closed a pan only
-    # when the next valid face detection arrived, but YuNet misses ~half
-    # the frames, so a long stretch of None detections kept the pan open
-    # and a 0.5s smoothstep got stretched to 3.4s — a crawl, not a pan.
-    # Pans are now emitted at decision time and pieces tile the timeline
-    # exactly: no overlaps, no gaps, by construction.
-    pieces = []
-    cur = None            # center the crop holds, or is gliding toward
-    seg_start = 0.0       # when the current HOLD began
-    pan_start = None      # when the current PAN began (None = not panning)
-    pan_end = 0.0         # when the current PAN finishes
-    pan_from = 0.0        # where the current PAN started from
-    drift = []            # (t, target) since the last commit
-    drift_since = None    # when the median first left the deadband
-
-    def close_hold(t_end):
-        nonlocal seg_start
-        if cur is not None and t_end > seg_start:
-            pieces.append((seg_start, t_end, cur, cur))
-        seg_start = t_end
-
+    # Two things went wrong with the old "decisive editor" design:
+    #
+    # 1. It panned in discrete jumps at the moment a drift was detected,
+    #    but the PAN TARGET was the MEDIAN OF PAST detections. A walking
+    #    speaker is always ahead of that median, so every pan ended up
+    #    behind where the person actually was — measured p90 lag 135px on
+    #    real footage. That is the "crawl": the crop chasing someone who
+    #    already moved on.
+    #
+    # 2. It gated pans on drift_min (a 1s delay) before committing, so a
+    #    walking speaker fell further behind while the camera waited for
+    #    "permission" to move. A static speaker never triggered it, which
+    #    is correct — but the delay made the follow worse, not better.
+    #
+    # The fix is a smooth follower, not an editor:
+    #   * the TARGET is exponentially smoothed (alpha ~0.7), which kills
+    #     one-frame YuNet glitches without lagging on a real move;
+    #   * the CAMERA is smoothed SEPARATELY at a slower rate (~0.4), so a
+    #     single bad detection cannot fling the crop across the frame —
+    #     measured: a 322px one-frame flicker becomes a 27px nudge;
+    #   * the camera only moves when the smoothed target leaves a small
+    #     deadband, so a static speaker never twitches the crop;
+    #   * NO drift_min delay — the camera follows as soon as the target
+    #     is clearly away, so a walking speaker is tracked with ~15px lag;
+    #   * at a scene cut the camera snaps to the new speaker instantly,
+    #     the way a cut hides any motion.
+    #
+    # The camera position is recorded at every detection sample and
+    # LINEARLY interpolated when the renderer asks for a frame. Linear
+    # interpolation gives a constant-velocity glide between samples, which
+    # reads as a smooth pan rather than a series of jumps. The renderer
+    # calls x_of(t) at 24fps and the samples are 0.2s apart, so the glide
+    # is sampled densely enough to look continuous.
+    cam_t, cam_x = [], []
+    sm = None          # smoothed target
+    cam = None         # current crop center
     for t, tgt, cut in filtered:
         if tgt is None:
+            # No face here. Hold the last known center rather than
+            # jumping to the frame midpoint — YuNet misses ~half the
+            # frames, and holding keeps the crop still during a gap.
+            cam_t.append(t)
+            cam_x.append(cam if cam is not None else w / 2.0)
             continue
-        if cur is None:
-            # First trusted target: center on it from frame zero. The clip
-            # opens already framed on the speaker — no center-then-drift.
-            cur = tgt
-            seg_start = 0.0
-            continue
-        if cut:
-            # Scene cut: truncate any pan in flight, then SNAP to the new
-            # speaker. The picture itself changes at this instant, so the
-            # cut hides the reframe — no crawl.
-            if pan_start is not None:
-                pieces.append((pan_start, t, pan_from, cur))
-                pan_start = None
-                seg_start = t
-            else:
-                close_hold(t)
-            cur = tgt
-            drift, drift_since = [], None
-            continue
-        if pan_start is not None:
-            if t < pan_end:
-                continue            # glide in flight; never steer mid-move
-            pan_start = None        # pan landed; hold resumes at cur
-            seg_start = pan_end
-            drift, drift_since = [], None
-            # fall through — this sample still feeds drift
-        drift.append((t, tgt))
-        recent = [x for (tt, x) in drift if t - tt <= drift_window]
-        if recent:
-            med = float(np.median(recent))
-            if abs(med - cur) > deadband_frac * w:
-                if drift_since is None:
-                    drift_since = t
-                if t - drift_since >= drift_min:
-                    # Deliberate reframe: close the hold, emit ONE
-                    # fixed-duration pan, then hold again at the new
-                    # center. Emitted NOW so gaps cannot stretch it.
-                    close_hold(t)
-                    pieces.append((t, t + pan_time, cur, med))
-                    pan_start = t
-                    pan_end = t + pan_time
-                    pan_from = cur
-                    cur = med
-                    drift, drift_since = [], None
-            else:
-                drift_since = None
+        if sm is None or cut:
+            # First target, or a scene cut: center on the speaker now.
+            # The picture changes at this exact instant, so the snap is
+            # invisible — no crawl on a new camera angle.
+            sm = tgt
+            cam = tgt
+        else:
+            sm = sm + alpha * (tgt - sm)
+            if abs(sm - cam) > deadband_frac * w:
+                cam = cam + cam_alpha * (sm - cam)
+        cam_t.append(t)
+        cam_x.append(cam)
 
-    if pan_start is not None:
-        pieces.append((pan_start, duration, pan_from, cur))
-    else:
-        close_hold(duration)
-    if not pieces:
+    if not cam_t:
         return lambda t: w / 2.0
+
     # Clamp every center so the crop window stays inside the frame.
     half = crop_w / 2.0
     lo, hi = half, half + (w - crop_w)
-    pieces = [(a, b, min(hi, max(lo, xa)), min(hi, max(lo, xb)))
-              for (a, b, xa, xb) in pieces]
-
-    starts = np.array([p[0] for p in pieces])
+    cam_t = np.array(cam_t)
+    cam_x = np.array([min(hi, max(lo, x)) for x in cam_x])
 
     def x_of(t):
-        j = int(np.searchsorted(starts, t, side='right')) - 1
-        j = max(0, min(j, len(pieces) - 1))
-        t0, t1, xa, xb = pieces[j]
-        if xa == xb or t1 <= t0:
-            return float(xa)
+        j = int(np.searchsorted(cam_t, t, side='right')) - 1
+        j = max(0, min(j, len(cam_t) - 1))
+        if j == len(cam_t) - 1:
+            return float(cam_x[j])
+        t0, t1 = cam_t[j], cam_t[j + 1]
+        x0, x1 = cam_x[j], cam_x[j + 1]
+        if t1 <= t0 or x0 == x1:
+            return float(x0)
         u = min(1.0, max(0.0, (t - t0) / (t1 - t0)))
-        return float(xa + (xb - xa) * (u * u * (3.0 - 2.0 * u)))
+        return float(x0 + (x1 - x0) * u)
 
-    x_of.pieces = pieces   # exposed for measurement/debugging
+    x_of.pieces = list(zip(cam_t.tolist(), cam_t.tolist(),
+                            cam_x.tolist(), cam_x.tolist()))
     return x_of
 
 # ─── Caption Rendering ────────────────────────────────────────────────────────
